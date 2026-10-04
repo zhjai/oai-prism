@@ -7,6 +7,7 @@ export interface AccountStats {
   id: string;
   name: string;
   enabled: boolean;
+  available: boolean;
   plan: string;
   email: string;
   has_access_token: boolean;

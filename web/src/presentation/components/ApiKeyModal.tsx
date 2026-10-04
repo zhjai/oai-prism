@@ -1,8 +1,9 @@
 import React, { useEffect, useState } from 'react';
-import { Modal, Table, Button, Space, Typography, message, Input, Tabs, Popconfirm, theme } from 'antd';
+import { Modal, Table, Button, Space, Typography, message, Input, Select, Tabs, Popconfirm, Tag, theme } from 'antd';
 import { KeyOutlined, CopyOutlined, PlusOutlined, DeleteOutlined, CodeOutlined } from '@ant-design/icons';
 import { getApiKey, setApiKey, httpClient } from '../../infrastructure/http/client';
 import { formatDateTime } from '../utils/format';
+import type { AccountStats, AdminAccountsResponse } from '../../domain/account/entity';
 
 const { Text, Paragraph } = Typography;
 
@@ -15,6 +16,8 @@ interface ApiKeyItem {
   key: string;
   name: string;
   created_at: string;
+  account_ids: string[];
+  account_restricted: boolean;
 }
 
 export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ open, onClose }) => {
@@ -24,13 +27,23 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ open, onClose }) => {
   const [newKeyName, setNewKeyName] = useState('');
   const [manualKey, setManualKey] = useState('');
   const [loadError, setLoadError] = useState('');
+  const [accounts, setAccounts] = useState<AccountStats[]>([]);
+  const [newAccountIds, setNewAccountIds] = useState<string[]>([]);
+  const [editingKey, setEditingKey] = useState<ApiKeyItem | null>(null);
+  const [bindingIds, setBindingIds] = useState<string[]>([]);
+  const [savingBindings, setSavingBindings] = useState(false);
+  const accountOptions = accounts.map((a) => ({ value: a.id, label: `${a.name} (${a.id})${a.enabled ? '' : ' · 已停用'}` }));
 
   const fetchKeys = async (): Promise<ApiKeyItem[]> => {
     setLoading(true);
     try {
-      const res = await httpClient.get<ApiKeyItem[]>('/admin/apikeys');
+      const [res, accountRes] = await Promise.all([
+        httpClient.get<ApiKeyItem[]>('/admin/apikeys'),
+        httpClient.get<AdminAccountsResponse>('/admin/accounts'),
+      ]);
       const list = res.data || [];
       setKeys(list);
+      setAccounts(accountRes.data.accounts);
       setLoadError('');
       return list;
     } catch (err: any) {
@@ -45,19 +58,20 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ open, onClose }) => {
 
   useEffect(() => {
     if (open) {
-      fetchKeys();
+      void Promise.resolve().then(fetchKeys);
     }
   }, [open]);
 
   const handleCreate = async () => {
     try {
-      await httpClient.post('/admin/apikeys', { name: newKeyName || '新访问密钥' });
+      const res = await httpClient.post<ApiKeyItem>('/admin/apikeys', { name: newKeyName || '新访问密钥', account_ids: newAccountIds });
       message.success('已生成新的对外 API 密钥！');
       setNewKeyName('');
+      setNewAccountIds([]);
       // 生成即设为默认：页面内所有 /v1 与 /admin 请求自动携带
       // （fetchKeys 返回最新列表，避免 stale closure 拿到旧 keys）
-      const list = await fetchKeys();
-      if (list[0]?.key) setApiKey(list[0].key);
+      setApiKey(res.data.key);
+      await fetchKeys();
     } catch (err: any) {
       message.error(`生成失败: ${err.message}`);
     }
@@ -65,11 +79,28 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ open, onClose }) => {
 
   const handleDelete = async (k: string) => {
     try {
-      await httpClient.delete(`/admin/apikeys/${k}`);
+      await httpClient.delete(`/admin/apikeys/${encodeURIComponent(k)}`);
+      if (getApiKey() === k) setApiKey(keys.find((item) => item.key !== k)?.key || '');
       message.success('已注销该密钥');
       fetchKeys();
     } catch (err: any) {
       message.error(`删除失败: ${err.message}`);
+    }
+  };
+
+  const handleSaveBindings = async () => {
+    if (!editingKey) return;
+    setSavingBindings(true);
+    try {
+      await httpClient.put(`/admin/apikeys/${encodeURIComponent(editingKey.key)}/bindings`, { account_ids: bindingIds });
+      message.success('账号绑定已保存并生效');
+      setEditingKey(null);
+      if (getApiKey() === editingKey.key) setApiKey(editingKey.key);
+      await fetchKeys();
+    } catch (err: any) {
+      message.error(err.message || '绑定保存失败');
+    } finally {
+      setSavingBindings(false);
     }
   };
 
@@ -111,6 +142,15 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ open, onClose }) => {
       ),
     },
     {
+      title: '绑定账号',
+      key: 'bindings',
+      render: (_: unknown, r: ApiKeyItem) => r.account_restricted
+        ? r.account_ids.length > 0
+          ? <Space size={4} wrap>{r.account_ids.map((id) => <Tag key={id}>{accounts.find((a) => a.id === id)?.name || id}</Tag>)}</Space>
+          : <Text type="warning">无可用绑定账号</Text>
+        : <Text type="secondary">全部启用账号</Text>,
+    },
+    {
       title: '创建时间',
       dataIndex: 'created_at',
       key: 'created_at',
@@ -125,6 +165,9 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({ open, onClose }) => {
       key: 'action',
       render: (_: any, r: ApiKeyItem) => (
         <Space>
+          <Button type="link" size="small" onClick={() => { setEditingKey(r); setBindingIds(r.account_ids || []); }}>
+            绑定账号
+          </Button>
           <Popconfirm
             title="设为当前使用的密钥？"
             description="页面内所有请求将改用此 Key（保存在浏览器本地）。"
@@ -202,6 +245,7 @@ experimental_bearer_token = "${firstKey}"`;
   };
 
   return (
+    <>
     <Modal
       title={
         <Space>
@@ -216,7 +260,7 @@ experimental_bearer_token = "${firstKey}"`;
           完成
         </Button>,
       ]}
-      width={780}
+      width={1000}
       destroyOnHidden
     >
       <Tabs
@@ -255,6 +299,16 @@ experimental_bearer_token = "${firstKey}"`;
                     生成新 Key
                   </Button>
                 </div>
+                <Select
+                  mode="multiple"
+                  aria-label="新密钥绑定账号"
+                  placeholder="绑定一个或多个账号；留空使用全部启用账号"
+                  value={newAccountIds}
+                  onChange={setNewAccountIds}
+                  options={accountOptions}
+                  optionFilterProp="label"
+                  style={{ width: '100%', marginBottom: 16 }}
+                />
                 <Table
                   rowKey="key"
                   columns={columns}
@@ -305,5 +359,28 @@ experimental_bearer_token = "${firstKey}"`;
         ]}
       />
     </Modal>
+    <Modal
+      title={`绑定账号 · ${editingKey?.name || ''}`}
+      open={Boolean(editingKey)}
+      onCancel={() => setEditingKey(null)}
+      onOk={handleSaveBindings}
+      confirmLoading={savingBindings}
+      okText="保存绑定"
+      cancelText="取消"
+      destroyOnHidden
+    >
+      <Paragraph type="secondary">支持绑定多个账号，请求只在绑定的启用账号中调度。清空并保存后可使用全部启用账号。</Paragraph>
+      <Select
+        mode="multiple"
+        aria-label="绑定账号选择"
+        placeholder="选择一个或多个账号"
+        value={bindingIds}
+        onChange={setBindingIds}
+        options={accountOptions}
+        optionFilterProp="label"
+        style={{ width: '100%' }}
+      />
+    </Modal>
+    </>
   );
 };

@@ -46,6 +46,7 @@ type fakeUpstream struct {
 	projectCount int
 	projectFails bool
 	startBodies  []map[string]any
+	startAuths   []string
 	statusBodies []map[string]any
 	stopBodies   []map[string]any
 	lastAuth     string
@@ -273,6 +274,7 @@ func (f *fakeUpstream) handler() http.Handler {
 
 		f.mu.Lock()
 		f.startBodies = append(f.startBodies, body)
+		f.startAuths = append(f.startAuths, r.Header.Get("Authorization"))
 		f.mu.Unlock()
 
 		// 复刻上游最直白的校验：input 必须是数组。

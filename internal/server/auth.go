@@ -23,7 +23,7 @@ type dynamicKeys struct {
 	ttl   time.Duration
 
 	mu     sync.Mutex
-	keys   []string
+	scopes map[string]account.Scope
 	loaded time.Time
 }
 
@@ -33,27 +33,37 @@ func newDynamicKeys(store *account.SQLiteStore) *dynamicKeys {
 
 // Get 返回当前有效的 Key 列表。
 func (d *dynamicKeys) Get() []string {
+	scopes := d.GetScopes()
+	keys := make([]string, 0, len(scopes))
+	for key := range scopes {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+// GetScopes returns one immutable snapshot for both authentication and routing.
+func (d *dynamicKeys) GetScopes() map[string]account.Scope {
 	if d == nil || d.store == nil {
 		return nil
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if time.Since(d.loaded) < d.ttl {
-		return d.keys
+		return d.scopes
 	}
 	list, err := d.store.ListAPIKeys()
 	if err != nil {
 		// 读库失败时沿用上一份：瞬时故障不应让所有调用方突然 401。
-		return d.keys
+		return d.scopes
 	}
-	keys := make([]string, 0, len(list))
+	scopes := make(map[string]account.Scope, len(list))
 	for _, it := range list {
 		if k := strings.TrimSpace(it.Key); k != "" {
-			keys = append(keys, k)
+			scopes[k] = account.Scope{Restricted: it.AccountRestricted, AccountIDs: it.AccountIDs}
 		}
 	}
-	d.keys, d.loaded = keys, time.Now()
-	return d.keys
+	d.scopes, d.loaded = scopes, time.Now()
+	return d.scopes
 }
 
 // Invalidate 让下一次 Get 重新读库（签发/注销 Key 后调用）。

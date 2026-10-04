@@ -44,6 +44,7 @@ export interface ChatSession {
   title: string;
   model: string;
   reasoningEffort: ReasoningEffort;
+  accountId?: string;
   createdAt: string;
   updatedAt: string;
   messages: ChatMessage[];
@@ -55,6 +56,7 @@ export interface SendMessageOptions {
   attachments?: ChatAttachment[];
   model: string;
   reasoningEffort: ReasoningEffort;
+  accountId?: string;
   /** 本会话此前的对话历史（不含本轮 user 消息与 assistant 占位）。
    * 上游不代管对话历史，每次请求必须回传完整 messages 才有上下文。 */
   history?: ChatMessage[];

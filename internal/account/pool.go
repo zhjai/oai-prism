@@ -68,9 +68,6 @@ func (p *Pool) Build(cfgs []config.AccountConfig) error {
 	seen := make(map[string]struct{}, len(cfgs))
 
 	for i, ac := range cfgs {
-		if !ac.IsEnabled() {
-			continue
-		}
 		id := ac.ID
 		if id == "" {
 			id = fmt.Sprintf("acct-%d", i+1)
@@ -98,7 +95,13 @@ func (p *Pool) Build(cfgs []config.AccountConfig) error {
 		if ac.Name == "" {
 			ac.Name = id
 		}
+		ac.ID = id
 		a := newAccount(ac, client, c)
+		if old := p.Get(id); old != nil {
+			a.total.Store(old.total.Load())
+			a.failures.Store(old.failures.Load())
+			a.lastUsedUnix.Store(old.lastUsedUnix.Load())
+		}
 		built = append(built, a)
 	}
 
@@ -106,6 +109,17 @@ func (p *Pool) Build(cfgs []config.AccountConfig) error {
 		// 高权重优先，让 least_inflight 在平票时也倾向优质账号。
 		return built[i].Weight > built[j].Weight
 	})
+	// Apply changes to waiting requests only after validating the whole build.
+	for _, old := range p.Accounts() {
+		enabled := false
+		for _, a := range built {
+			if a.ID == old.ID {
+				enabled = a.enabled.Load()
+				break
+			}
+		}
+		old.enabled.Store(enabled)
+	}
 
 	p.accounts.Store(&built)
 	if len(built) == 0 {
@@ -181,7 +195,7 @@ func (l *Lease) Release() {
 // 同一对话换号会直接 404，所以粘性不是优化而是正确性要求。
 func (p *Pool) Acquire(ctx context.Context, stickyKey string) (*Lease, error) {
 	now := time.Now()
-	all := p.Accounts()
+	all := p.candidates(ctx)
 	if len(all) == 0 {
 		return nil, ErrNoAccount
 	}
@@ -252,7 +266,7 @@ func (p *Pool) Acquire(ctx context.Context, stickyKey string) (*Lease, error) {
 		}
 
 		now = time.Now()
-		for _, a := range p.Accounts() {
+		for _, a := range p.candidates(ctx) {
 			if a.Available(now) && a.Acquire(now) {
 				if stickyKey != "" {
 					p.sticky.Put(stickyKey, a.ID, now)
@@ -273,6 +287,31 @@ func (p *Pool) Acquire(ctx context.Context, stickyKey string) (*Lease, error) {
 		return nil, fmt.Errorf("%w: 全部 %d 个账号已达并发上限", ErrNoAccount, len(all))
 	}
 	return nil, ErrNoAccount
+}
+
+func (p *Pool) candidates(ctx context.Context) []*Account {
+	var out []*Account
+	for _, a := range p.Accounts() {
+		if a.enabled.Load() && Allowed(ctx, a.ID) {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// AcquirePinned never falls back to another account.
+func (p *Pool) AcquirePinned(ctx context.Context, id string) (*Lease, error) {
+	if !Allowed(ctx, id) {
+		return nil, fmt.Errorf("指定账号不在 API Key 的绑定范围内")
+	}
+	a := p.Get(id)
+	if a == nil {
+		return nil, fmt.Errorf("指定账号不存在: %s", id)
+	}
+	if !a.Acquire(time.Now()) {
+		return nil, fmt.Errorf("指定账号已停用或暂不可用: %s", id)
+	}
+	return &Lease{Account: a, pool: p}, nil
 }
 
 // waitSticky 在粘性账号满并发时短暂等待其空出槽位。
@@ -505,6 +544,9 @@ func (p *Pool) refreshAll(ctx context.Context, r *creds.Refresher) {
 	now := time.Now()
 
 	for _, a := range p.Accounts() {
+		if !a.enabled.Load() {
+			continue
+		}
 		c := a.Credential()
 		if c == nil {
 			continue
@@ -587,6 +629,9 @@ func (p *Pool) healthLoop(ctx context.Context, interval time.Duration) {
 			return
 		case <-t.C:
 			for _, a := range p.Accounts() {
+				if !a.enabled.Load() {
+					continue
+				}
 				c := a.Credential()
 				// 只探那些"没有过期信息"或"已经过期"的账号——
 				// 有明确未来 exp 的账号交给刷新循环处理，探了也是浪费配额。

@@ -350,17 +350,24 @@ func TestPool_EmptyReturnsError(t *testing.T) {
 	}
 }
 
-func TestPool_DisabledAccountSkipped(t *testing.T) {
+func TestPool_DisabledAccountVisibleButNotScheduled(t *testing.T) {
 	no := false
 	p := testPool(t, "least_inflight",
 		config.AccountConfig{ID: "a", AccessToken: "t1", Enabled: &no},
 		config.AccountConfig{ID: "b", AccessToken: "t2"},
 	)
-	if p.Size() != 1 {
-		t.Fatalf("被禁用的账号不应进池，size=%d", p.Size())
+	if p.Size() != 2 {
+		t.Fatalf("停用账号必须保留在列表中，size=%d", p.Size())
 	}
-	if p.Get("a") != nil {
-		t.Fatal("被禁用的账号不应可查")
+	if p.Get("a") == nil || p.Get("a").Available(time.Now()) || p.Get("a").Acquire(time.Now()) {
+		t.Fatal("停用账号应可查但不可调度")
+	}
+	for i := 0; i < 5; i++ {
+		lease, err := p.Acquire(context.Background(), "")
+		if err != nil || lease.Account.ID != "b" {
+			t.Fatalf("停用账号被调度: %v", err)
+		}
+		lease.Release()
 	}
 }
 

@@ -298,9 +298,7 @@ func (h *Handler) readBody(r *http.Request) ([]byte, bool, error) {
 func (h *Handler) acquire(r *http.Request) (*account.Lease, error) {
 	// 显式指定账号。
 	if id := strings.TrimSpace(r.Header.Get("X-Oaiprism-Account")); id != "" {
-		if a := h.pool.Get(id); a != nil && a.Acquire(time.Now()) {
-			return &account.Lease{Account: a}, nil
-		}
+		return h.pool.AcquirePinned(r.Context(), id)
 	}
 
 	// 粘性键：用客户端提供的会话标识，或退化为"无粘性"。

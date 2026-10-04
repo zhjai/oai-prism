@@ -16,6 +16,7 @@ import {
   Popconfirm,
   Empty,
   theme,
+  Switch,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import {
@@ -58,6 +59,7 @@ export const AccountsPage: React.FC = () => {
     reloadPool,
     refreshAccount,
     deleteAccount,
+    updateAccount,
     openDetailDrawer,
     openEditModal,
     setImportModalOpen,
@@ -73,6 +75,7 @@ export const AccountsPage: React.FC = () => {
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
   const [refreshingId, setRefreshingId] = useState<string | null>(null);
+  const [togglingId, setTogglingId] = useState<string | null>(null);
 
   useEffect(() => {
     fetchAccounts();
@@ -92,9 +95,9 @@ export const AccountsPage: React.FC = () => {
 
       const matchStatus =
         statusFilter === 'all' ||
-        (statusFilter === 'enabled' && acc.enabled) ||
+        (statusFilter === 'enabled' && acc.available) ||
         (statusFilter === 'disabled' && !acc.enabled) ||
-        (statusFilter === 'cooldown' && acc.cooldown_sec > 0);
+        (statusFilter === 'cooldown' && acc.enabled && acc.cooldown_sec > 0);
 
       return matchSearch && matchPlan && matchStatus;
     });
@@ -108,8 +111,8 @@ export const AccountsPage: React.FC = () => {
     let expiring = 0;
     let earliest: string | undefined;
     for (const a of accounts) {
-      if (a.cooldown_sec > 0) cooling++;
-      else if (!a.enabled) disabled++;
+      if (!a.enabled) disabled++;
+      else if (a.cooldown_sec > 0) cooling++;
       inflight += a.inflight;
       if (a.token_expires && (a.expires_in_sec ?? 0) > 0) {
         if ((a.expires_in_sec ?? 0) < EXPIRING_WINDOW_SEC) expiring++;
@@ -195,6 +198,7 @@ export const AccountsPage: React.FC = () => {
       key: 'enabled',
       width: 108,
       render: (enabled, record) => {
+        if (!enabled) return <Badge status="default" text="已停用" />;
         if (record.cooldown_sec > 0) {
           return (
             <Tooltip title={`冷却中：因失败过多暂时避让，剩余 ${Math.round(record.cooldown_sec)} 秒后自动解除`}>
@@ -202,12 +206,12 @@ export const AccountsPage: React.FC = () => {
             </Tooltip>
           );
         }
-        if (enabled) {
+        if (record.available) {
           return <Badge status="success" text="健康可用" />;
         }
         return (
-          <Tooltip title={`已停用，连续失败 ${record.fail_streak} 次`}>
-            <Badge status="error" text="已停用" />
+          <Tooltip title={record.inflight >= record.max_concurrency && record.max_concurrency > 0 ? '并发槽位已满' : '请检查或刷新凭据'}>
+            <Badge status="warning" text="暂不可用" />
           </Tooltip>
         );
       },
@@ -230,6 +234,31 @@ export const AccountsPage: React.FC = () => {
             </Tooltip>
           )}
         </span>
+      ),
+    },
+    {
+      title: '启用',
+      key: 'toggle',
+      width: 88,
+      render: (_: unknown, record: AccountStats) => (
+        <Switch
+          checked={record.enabled}
+          checkedChildren="启用"
+          unCheckedChildren="停用"
+          loading={togglingId === record.id}
+          aria-label={`${record.name} 启用状态`}
+          onChange={async (enabled) => {
+            setTogglingId(record.id);
+            try {
+              await updateAccount(record.id, { enabled });
+              message.success(`账号已${enabled ? '启用' : '停用'}`);
+            } catch (err: any) {
+              message.error(err.message || '更新失败');
+            } finally {
+              setTogglingId(null);
+            }
+          }}
+        />
       ),
     },
     {

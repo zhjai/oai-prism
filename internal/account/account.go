@@ -19,11 +19,12 @@ import (
 // 因此这些字段全部用 atomic；只有限流桶用了 mutex（临界区仅几纳秒，
 // 且只在账号显式配置了速率限制时才存在）。
 type Account struct {
-	ID     string
-	Name   string
-	Tags   []string
-	Weight int
-	plan   string // Local plan label; refreshed upstream claims remain in the credential.
+	ID      string
+	Name    string
+	Tags    []string
+	Weight  int
+	plan    string // Local plan label; refreshed upstream claims remain in the credential.
+	enabled atomic.Bool
 
 	// Client 是该账号专属的上游客户端（可能走独立出口代理）。
 	Client *httpc.Client
@@ -77,6 +78,9 @@ func (a *Account) MaxConcurrency() int64 { return a.maxConc }
 // Available 判断账号当前是否可被调度。
 // Busy 报告账号是否"仅因并发已满而暂不可用"（未冷却且凭据可用）。
 func (a *Account) Busy(now time.Time) bool {
+	if !a.enabled.Load() {
+		return false
+	}
 	if a.maxConc <= 0 || a.inflight.Load() < a.maxConc {
 		return false
 	}
@@ -87,6 +91,9 @@ func (a *Account) Busy(now time.Time) bool {
 }
 
 func (a *Account) Available(now time.Time) bool {
+	if !a.enabled.Load() {
+		return false
+	}
 	if a.maxConc > 0 && a.inflight.Load() >= a.maxConc {
 		return false
 	}
@@ -112,6 +119,9 @@ func (a *Account) CooldownRemaining(now time.Time) time.Duration {
 // Acquire 占用一个并发额度并消耗一个限流令牌。
 // 返回 false 表示此刻不可用（调用方应换号或退避）。
 func (a *Account) Acquire(now time.Time) bool {
+	if !a.Available(now) {
+		return false
+	}
 	if a.maxConc > 0 {
 		for {
 			cur := a.inflight.Load()
@@ -189,6 +199,7 @@ type Stats struct {
 	ID           string   `json:"id"`
 	Name         string   `json:"name"`
 	Enabled      bool     `json:"enabled"`
+	Available    bool     `json:"available"`
 	Plan         string   `json:"plan"`
 	Email        string   `json:"email"`
 	HasToken     bool     `json:"has_access_token"`
@@ -214,7 +225,8 @@ func (a *Account) Stats(now time.Time) Stats {
 		ID:         a.ID,
 		Name:       a.Name,
 		Plan:       a.plan,
-		Enabled:    a.Available(now),
+		Enabled:    a.enabled.Load(),
+		Available:  a.Available(now),
 		Inflight:   a.inflight.Load(),
 		MaxConcur:  a.maxConc,
 		FailStreak: a.failStreak.Load(),
@@ -273,6 +285,7 @@ func newAccount(cfg config.AccountConfig, client *httpc.Client, c *creds.Credent
 		a.limiter = rate.NewLimiter(rate.Limit(cfg.RatePerSecond), burst)
 	}
 	a.cred.Store(c)
+	a.enabled.Store(cfg.IsEnabled())
 	a.refreshCond = sync.NewCond(&a.refreshMu)
 	return a
 }

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Avatar, Button, Card, Dropdown, Input, List, Modal, Popconfirm, Space, Tooltip, Typography, Upload, message, theme } from 'antd';
+import { Avatar, Button, Card, Dropdown, Input, List, Modal, Popconfirm, Select, Space, Tooltip, Typography, Upload, message, theme } from 'antd';
 import {
   RobotOutlined,
   UserOutlined,
@@ -21,6 +21,8 @@ import { Bubble, Sender, ThoughtChain, Prompts } from '@ant-design/x';
 import type { ReasoningEffort } from '../../../domain/chat/entity';
 import { effortsForModel } from '../../../domain/modelFilter';
 import { useChatStore } from '../../../application/chat/store';
+import type { AccountStats } from '../../../domain/account/entity';
+import { httpClient, onCredentialChange } from '../../../infrastructure/http/client';
 import { BrandLogo } from '../../components/BrandLogo';
 import { SPECTRUM } from '../../theme/tokens';
 import { MarkdownView } from './markdown/MarkdownView';
@@ -46,6 +48,7 @@ export const ChatPlaygroundPage: React.FC = () => {
     currentSessionId,
     selectedModel,
     reasoningEffort,
+    selectedAccountId,
     isStreaming,
     lastUsage,
     init,
@@ -55,10 +58,13 @@ export const ChatPlaygroundPage: React.FC = () => {
     renameSession,
     setModel,
     setReasoningEffort,
+    setAccount,
     sendMessage,
   } = useChatStore();
 
   const [input, setInput] = useState('');
+  const [accounts, setAccounts] = useState<AccountStats[]>([]);
+  const [accountError, setAccountError] = useState('');
   const [attachments, setAttachments] = useState<{ name: string; dataUrl: string }[]>([]);
   const msgListRef = useRef<HTMLDivElement>(null);
 
@@ -70,6 +76,24 @@ export const ChatPlaygroundPage: React.FC = () => {
   useEffect(() => {
     init();
   }, [init]);
+
+  useEffect(() => {
+    const load = async () => {
+      try {
+        const res = await httpClient.get<{ accounts: AccountStats[] }>('/v1/accounts');
+        setAccounts(res.data.accounts);
+        setAccountError('');
+      } catch (err: any) {
+        setAccounts([]);
+        setAccountError(err.message || '账号加载失败');
+      }
+    };
+    void load();
+    const unsubscribe = onCredentialChange(() => void load());
+    window.addEventListener('focus', load);
+    const timer = window.setInterval(load, 10000);
+    return () => { unsubscribe(); window.removeEventListener('focus', load); window.clearInterval(timer); };
+  }, []);
 
   // 当前模型的可用推理档位（由后端清单中的档位变体推导，如 6 Luna 没有 low）
   const availableEfforts = effortsForModel(selectedModel, allModelIds);
@@ -105,6 +129,10 @@ export const ChatPlaygroundPage: React.FC = () => {
 
   const handleSend = () => {
     if (!input.trim() || isStreaming) return;
+    if (selectedAccountId && !accounts.some((a) => a.id === selectedAccountId && a.enabled)) {
+      message.warning('所选账号已停用、删除或不在当前 Key 的绑定范围，请重新选择');
+      return;
+    }
     const text = input;
     const atts = attachments;
     setInput('');
@@ -422,6 +450,28 @@ export const ChatPlaygroundPage: React.FC = () => {
               }
               prefix={
                 <Space size={2} wrap>
+                  <Tooltip title={accountError || '选择本会话使用的上游账号；自动调度遵循当前 API Key 的绑定范围'}>
+                    <Select
+                      aria-label="调试账号"
+                      value={selectedAccountId}
+                      disabled={isStreaming}
+                      onChange={setAccount}
+                      style={{ minWidth: 180, maxWidth: 240 }}
+                      showSearch
+                      optionFilterProp="label"
+                      options={[
+                        { value: '', label: '自动调度账号' },
+                        ...accounts.map((a) => ({
+                          value: a.id,
+                          label: `${a.name} (${a.id})${!a.enabled ? ' · 已停用' : !a.available ? ' · 暂不可用' : ''}`,
+                          disabled: !a.enabled,
+                        })),
+                        ...(selectedAccountId && !accounts.some((a) => a.id === selectedAccountId)
+                          ? [{ value: selectedAccountId, label: `${selectedAccountId} · 不可选`, disabled: true }]
+                          : []),
+                      ]}
+                    />
+                  </Tooltip>
                   <Dropdown menu={modelMenu} trigger={['click']} placement="topLeft">
                     <Button type="text" shape="round" icon={<RobotOutlined style={{ color: token.colorPrimary }} />}>
                       {currentModel?.name || selectedModel}

@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/oai-prism/oaiprism/internal/account"
 	"github.com/oai-prism/oaiprism/internal/metrics"
 )
 
@@ -423,6 +424,8 @@ type AuthOptions struct {
 	// DynamicKeys 返回 Dashboard 签发并持久化在 SQLite 里的 Key（可为 nil）。
 	// 每请求调用一次，实现方需自行缓存。
 	DynamicKeys func() []string
+	// DynamicScopes supplies authentication and account permissions atomically.
+	DynamicScopes func() map[string]account.Scope
 	// AdminToken 校验 /admin/login 签发的会话令牌（可为 nil）。
 	AdminToken func(token string) bool
 	// ExemptPaths 精确豁免（探针端点）。
@@ -478,8 +481,15 @@ func Auth(o AuthOptions) Middleware {
 
 			key := requestKey(r)
 			var dynamic [][]byte
+			var scopes map[string]account.Scope
 			if o.DynamicKeys != nil {
 				dynamic = toByteKeys(o.DynamicKeys())
+			}
+			if o.DynamicScopes != nil {
+				scopes = o.DynamicScopes()
+				for k := range scopes {
+					dynamic = append(dynamic, []byte(k))
+				}
 			}
 			isStatic := matchAny(static, key)
 			isAdminToken := key != "" && o.AdminToken != nil && o.AdminToken(key)
@@ -519,7 +529,16 @@ func Auth(o AuthOptions) Middleware {
 			if key != "" && valid {
 				tenant = tenantOf(key)
 			}
-			next.ServeHTTP(w, r.WithContext(WithTenant(r.Context(), tenant)))
+			ctx := WithTenant(r.Context(), tenant)
+			if scope, ok := scopes[key]; ok && !isAdminToken {
+				ctx = account.WithScope(ctx, scope)
+			}
+			// Validate explicit selection before starting an SSE response.
+			if id := strings.TrimSpace(r.Header.Get("X-Oaiprism-Account")); id != "" && !account.Allowed(ctx, id) && !strings.HasPrefix(r.URL.Path, adminPrefix) {
+				writeAuthError(w, http.StatusForbidden, "account_forbidden", "指定账号不在 API Key 的绑定范围内")
+				return
+			}
+			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }

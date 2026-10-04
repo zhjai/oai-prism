@@ -162,9 +162,9 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		// 限流在鉴权之前：拒绝无效流量越早越省资源。
 		middleware.NewRateLimiter(cfg.Facade.RateLimitPerSecond(), cfg.Facade.RateLimitBurst(), app).Middleware(),
 		middleware.Auth(middleware.AuthOptions{
-			StaticKeys:  cfg.Facade.APIKeys,
-			DynamicKeys: s.keys.Get,
-			AdminToken:  s.admins.Valid,
+			StaticKeys:    cfg.Facade.APIKeys,
+			DynamicScopes: s.keys.GetScopes,
+			AdminToken:    s.admins.Valid,
 			ExemptPaths: []string{
 				cfg.Metrics.Health, cfg.Metrics.Ready, cfg.Metrics.Path,
 				// 登录本身与 OAuth 浏览器回调（由 state 保护）不能要求已登录。
@@ -365,6 +365,18 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 		})
 	})
 
+	// The Chat playground can only select accounts allowed by its current Key.
+	mux.HandleFunc("GET /v1/accounts", func(w http.ResponseWriter, r *http.Request) {
+		out := make([]account.Stats, 0)
+		for _, a := range s.pool.Accounts() {
+			if account.Allowed(r.Context(), a.ID) {
+				out = append(out, a.Stats(time.Now()))
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"accounts": out})
+	})
+
 	// POST /admin/accounts: 创建/批量导入账号并持久化至 SQLite
 	mux.HandleFunc("POST /admin/accounts", func(w http.ResponseWriter, r *http.Request) {
 		var body json.RawMessage
@@ -502,6 +514,7 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 				writeAdminErr(w, http.StatusNotFound, err.Error())
 				return
 			}
+			s.keys.Invalidate()
 			_ = s.syncPoolFromSQLite()
 		}
 
@@ -769,7 +782,10 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 	// POST /admin/apikeys: 创建或生成新 API Key
 	mux.HandleFunc("POST /admin/apikeys", func(w http.ResponseWriter, r *http.Request) {
 		var item account.APIKeyItem
-		_ = json.NewDecoder(r.Body).Decode(&item)
+		if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
+			writeAdminErr(w, http.StatusBadRequest, "解析密钥数据失败")
+			return
+		}
 		item.Key = strings.TrimSpace(item.Key)
 		if item.Key == "" {
 			item.Key = account.NewAPIKey()
@@ -780,17 +796,53 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 		if item.Name == "" {
 			item.Name = "对外访问密钥"
 		}
+		item.AccountRestricted = item.AccountRestricted || len(item.AccountIDs) > 0
 		if s.sqlite == nil {
 			writeAdminErr(w, http.StatusInternalServerError, "SQLite 存储未初始化")
 			return
 		}
 		if err := s.sqlite.SaveAPIKey(item); err != nil {
+			if errors.Is(err, account.ErrInvalidAccountBinding) {
+				writeAdminErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
 			writeAdminErr(w, http.StatusInternalServerError, "保存 API Key 失败: "+err.Error())
 			return
 		}
 		s.keys.Invalidate()
 		w.Header().Set("Content-Type", "application/json")
+		if item.AccountIDs == nil {
+			item.AccountIDs = []string{}
+		}
 		_ = json.NewEncoder(w).Encode(item)
+	})
+
+	mux.HandleFunc("PUT /admin/apikeys/{key}/bindings", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			AccountIDs []string `json:"account_ids"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.AccountIDs == nil {
+			writeAdminErr(w, http.StatusBadRequest, "account_ids 必须为账号 ID 数组；空数组表示全部启用账号")
+			return
+		}
+		if s.sqlite == nil {
+			writeAdminErr(w, http.StatusServiceUnavailable, "SQLite 存储未初始化")
+			return
+		}
+		if err := s.sqlite.SetAPIKeyBindings(r.PathValue("key"), body.AccountIDs); err != nil {
+			code := http.StatusInternalServerError
+			if errors.Is(err, account.ErrInvalidAccountBinding) {
+				code = http.StatusBadRequest
+			}
+			if errors.Is(err, account.ErrAPIKeyNotFound) {
+				code = http.StatusNotFound
+			}
+			writeAdminErr(w, code, err.Error())
+			return
+		}
+		s.keys.Invalidate()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "account_ids": body.AccountIDs})
 	})
 
 	// DELETE /admin/apikeys/{key}: 物理注销 API Key
@@ -1118,6 +1170,7 @@ func (s *Server) syncPoolFromFile(list []config.AccountConfig) error {
 			a.Email = current.Email
 			a.Plan = current.Plan
 			a.MaxConcurrency = current.MaxConcurrency
+			a.Enabled = current.Enabled
 			a.Tags = current.Tags
 		}
 		if err := s.sqlite.SaveAccount(a); err != nil {

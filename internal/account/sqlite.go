@@ -83,6 +83,7 @@ func (s *SQLiteStore) initSchema() error {
 		access_token TEXT DEFAULT '',
 		refresh_token TEXT DEFAULT '',
 		max_concurrency INTEGER DEFAULT 2,
+		enabled INTEGER NOT NULL DEFAULT 1,
 		tags TEXT DEFAULT '',
 		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	);
@@ -111,6 +112,7 @@ func (s *SQLiteStore) initSchema() error {
 		title TEXT NOT NULL,
 		model TEXT NOT NULL,
 		reasoning_effort TEXT NOT NULL,
+		account_id TEXT NOT NULL DEFAULT '',
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	);
@@ -129,18 +131,59 @@ func (s *SQLiteStore) initSchema() error {
 	CREATE TABLE IF NOT EXISTS api_keys (
 		key TEXT PRIMARY KEY,
 		name TEXT NOT NULL,
+		account_restricted INTEGER NOT NULL DEFAULT 0,
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE IF NOT EXISTS api_key_accounts (
+		api_key TEXT NOT NULL,
+		account_id TEXT NOT NULL,
+		PRIMARY KEY (api_key, account_id)
 	);
 	`
 	_, err := s.db.Exec(schema + nativeBindingsSchema)
 	if err != nil {
 		return fmt.Errorf("初始化 sqlite 表结构失败: %w", err)
 	}
+	for _, migration := range []struct{ table, column, definition string }{
+		{"accounts", "enabled", "INTEGER NOT NULL DEFAULT 1"},
+		{"chat_sessions", "account_id", "TEXT NOT NULL DEFAULT ''"},
+		{"api_keys", "account_restricted", "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if err := s.ensureColumn(migration.table, migration.column, migration.definition); err != nil {
+			return fmt.Errorf("迁移 sqlite 表结构失败: %w", err)
+		}
+	}
 
 	// 不再内置默认密钥：写死在源码里的 Key 对所有人公开，等于没有鉴权。
 	// 没有任何 Key 时鉴权中间件只放行本机请求，用户在 Dashboard 生成
 	// 第一把 Key 后自动转为全量校验。
 	return nil
+}
+
+// Names and definitions are internal constants, never request data.
+func (s *SQLiteStore) ensureColumn(table, column, definition string) error {
+	rows, err := s.db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return err
+	}
+	found := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, typ string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return err
+		}
+		found = found || name == column
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil || found {
+		return err
+	}
+	_, err = s.db.Exec("ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition)
+	return err
 }
 
 // Close 关闭数据库。
@@ -189,7 +232,7 @@ func (s *SQLiteStore) Load() ([]config.AccountConfig, error) {
 	}
 
 	rows, err := s.db.Query(`
-		SELECT id, name, plan, email, cookies, access_token, refresh_token, max_concurrency, tags
+		SELECT id, name, plan, email, cookies, access_token, refresh_token, max_concurrency, tags, enabled
 		FROM accounts
 		ORDER BY updated_at DESC
 	`)
@@ -202,6 +245,7 @@ func (s *SQLiteStore) Load() ([]config.AccountConfig, error) {
 	for rows.Next() {
 		var a config.AccountConfig
 		var tagsStr string
+		var enabled bool
 		err := rows.Scan(
 			&a.ID,
 			&a.Name,
@@ -212,6 +256,7 @@ func (s *SQLiteStore) Load() ([]config.AccountConfig, error) {
 			&a.RefreshToken,
 			&a.MaxConcurrency,
 			&tagsStr,
+			&enabled,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("读取账号行失败: %w", err)
@@ -219,6 +264,7 @@ func (s *SQLiteStore) Load() ([]config.AccountConfig, error) {
 		if tagsStr != "" {
 			_ = json.Unmarshal([]byte(tagsStr), &a.Tags)
 		}
+		a.Enabled = &enabled
 		list = append(list, a)
 	}
 	return list, rows.Err()
@@ -260,8 +306,8 @@ func (s *SQLiteStore) SaveAccount(a config.AccountConfig) error {
 	}
 
 	query := `
-	INSERT INTO accounts (id, name, plan, email, cookies, access_token, refresh_token, max_concurrency, tags, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	INSERT INTO accounts (id, name, plan, email, cookies, access_token, refresh_token, max_concurrency, tags, enabled, updated_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 	ON CONFLICT(id) DO UPDATE SET
 		name = excluded.name,
 		plan = excluded.plan,
@@ -271,6 +317,7 @@ func (s *SQLiteStore) SaveAccount(a config.AccountConfig) error {
 		refresh_token = CASE WHEN excluded.refresh_token != '' THEN excluded.refresh_token ELSE accounts.refresh_token END,
 		max_concurrency = excluded.max_concurrency,
 		tags = excluded.tags,
+		enabled = CASE WHEN ? THEN excluded.enabled ELSE accounts.enabled END,
 		updated_at = CURRENT_TIMESTAMP;
 	`
 	_, err := s.db.Exec(query,
@@ -283,6 +330,8 @@ func (s *SQLiteStore) SaveAccount(a config.AccountConfig) error {
 		a.RefreshToken,
 		a.MaxConcurrency,
 		tagsJSON,
+		a.IsEnabled(),
+		a.Enabled != nil,
 	)
 	if err != nil {
 		return fmt.Errorf("保存账号 %s 至 SQLite 失败: %w", a.ID, err)
@@ -305,7 +354,12 @@ func (s *SQLiteStore) DeleteAccount(id string) error {
 		return errSQLiteUnavailable
 	}
 
-	res, err := s.db.Exec("DELETE FROM accounts WHERE id = ?", id)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec("DELETE FROM accounts WHERE id = ?", id)
 	if err != nil {
 		return fmt.Errorf("从 SQLite 删除账号 %s 失败: %w", id, err)
 	}
@@ -313,7 +367,12 @@ func (s *SQLiteStore) DeleteAccount(id string) error {
 	if affected == 0 {
 		return fmt.Errorf("账号不存在: %s", id)
 	}
-	return nil
+	// Keep account_restricted set even when the final binding is removed.
+	// An empty restricted key must never silently gain access to every account.
+	if _, err := tx.Exec("DELETE FROM api_key_accounts WHERE account_id = ?", id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // MigrateIfEmpty 如果 SQLite 为空，自动把现有列表迁移进来。
@@ -722,6 +781,7 @@ type ChatSessionRecord struct {
 	Title           string    `json:"title"`
 	Model           string    `json:"model"`
 	ReasoningEffort string    `json:"reasoning_effort"`
+	AccountID       string    `json:"account_id"`
 	CreatedAt       time.Time `json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
 }
@@ -753,7 +813,7 @@ func (s *SQLiteStore) ListChatSessions() ([]ChatSessionRecord, error) {
 	}
 
 	rows, err := s.db.Query(`
-		SELECT id, title, model, reasoning_effort, created_at, updated_at
+		SELECT id, title, model, reasoning_effort, created_at, updated_at, account_id
 		FROM chat_sessions
 		ORDER BY updated_at DESC
 	`)
@@ -766,7 +826,7 @@ func (s *SQLiteStore) ListChatSessions() ([]ChatSessionRecord, error) {
 	for rows.Next() {
 		var r ChatSessionRecord
 		var cStr, uStr string
-		if err := rows.Scan(&r.ID, &r.Title, &r.Model, &r.ReasoningEffort, &cStr, &uStr); err != nil {
+		if err := rows.Scan(&r.ID, &r.Title, &r.Model, &r.ReasoningEffort, &cStr, &uStr, &r.AccountID); err != nil {
 			continue
 		}
 		if t, err := time.Parse("2006-01-02 15:04:05", cStr); err == nil {
@@ -796,15 +856,16 @@ func (s *SQLiteStore) SaveChatSession(sess ChatSessionRecord) error {
 	}
 
 	query := `
-	INSERT INTO chat_sessions (id, title, model, reasoning_effort, created_at, updated_at)
-	VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+	INSERT INTO chat_sessions (id, title, model, reasoning_effort, account_id, created_at, updated_at)
+	VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
 	ON CONFLICT(id) DO UPDATE SET
 		title = excluded.title,
 		model = excluded.model,
 		reasoning_effort = excluded.reasoning_effort,
+		account_id = excluded.account_id,
 		updated_at = CURRENT_TIMESTAMP;
 	`
-	_, err := s.db.Exec(query, sess.ID, sess.Title, sess.Model, sess.ReasoningEffort)
+	_, err := s.db.Exec(query, sess.ID, sess.Title, sess.Model, sess.ReasoningEffort, sess.AccountID)
 	return err
 }
 
@@ -909,9 +970,11 @@ func (s *SQLiteStore) SaveChatMessage(m ChatMessageRecord) error {
 
 // APIKeyItem 对外调用 API 密钥。
 type APIKeyItem struct {
-	Key       string    `json:"key"`
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"created_at"`
+	Key               string    `json:"key"`
+	Name              string    `json:"name"`
+	CreatedAt         time.Time `json:"created_at"`
+	AccountIDs        []string  `json:"account_ids"`
+	AccountRestricted bool      `json:"account_restricted"`
 }
 
 // DefaultPublicAPIKey 是早期版本自动种入的默认 Key。它写死在源码里，
@@ -945,7 +1008,7 @@ func (s *SQLiteStore) ListAPIKeys() ([]APIKeyItem, error) {
 	}
 
 	rows, err := s.db.Query(`
-		SELECT key, name, created_at
+		SELECT key, name, created_at, account_restricted
 		FROM api_keys
 		ORDER BY created_at DESC
 	`)
@@ -954,19 +1017,40 @@ func (s *SQLiteStore) ListAPIKeys() ([]APIKeyItem, error) {
 	}
 	defer rows.Close()
 
-	var list []APIKeyItem
+	list := make([]APIKeyItem, 0)
+	byKey := make(map[string]int)
 	for rows.Next() {
 		var it APIKeyItem
 		var cStr string
-		if err := rows.Scan(&it.Key, &it.Name, &cStr); err != nil {
-			continue
+		if err := rows.Scan(&it.Key, &it.Name, &cStr, &it.AccountRestricted); err != nil {
+			return nil, err
 		}
 		if t, err := time.Parse("2006-01-02 15:04:05", cStr); err == nil {
 			it.CreatedAt = t
 		}
+		it.AccountIDs = []string{}
+		byKey[it.Key] = len(list)
 		list = append(list, it)
 	}
-	return list, nil
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	bindings, err := s.db.Query("SELECT api_key, account_id FROM api_key_accounts ORDER BY account_id")
+	if err != nil {
+		return nil, err
+	}
+	defer bindings.Close()
+	for bindings.Next() {
+		var key, id string
+		if err := bindings.Scan(&key, &id); err != nil {
+			return nil, err
+		}
+		if i, ok := byKey[key]; ok {
+			list[i].AccountIDs = append(list[i].AccountIDs, id)
+		}
+	}
+	return list, bindings.Err()
 }
 
 // SaveAPIKey 保存新的 API Key。
@@ -991,13 +1075,25 @@ func (s *SQLiteStore) SaveAPIKey(item APIKeyItem) error {
 		item.Name = "新建访问令牌"
 	}
 
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	query := `
 	INSERT INTO api_keys (key, name, created_at)
 	VALUES (?, ?, CURRENT_TIMESTAMP)
 	ON CONFLICT(key) DO UPDATE SET name = excluded.name;
 	`
-	_, err := s.db.Exec(query, item.Key, item.Name)
-	return err
+	if _, err := tx.Exec(query, item.Key, item.Name); err != nil {
+		return err
+	}
+	if item.AccountIDs != nil || item.AccountRestricted {
+		if err := replaceKeyBindings(tx, item.Key, item.AccountIDs, item.AccountRestricted || len(item.AccountIDs) > 0); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // DeleteAPIKey 删除指定的 API Key。
@@ -1015,6 +1111,65 @@ func (s *SQLiteStore) DeleteAPIKey(key string) error {
 		return errSQLiteUnavailable
 	}
 
-	_, err := s.db.Exec("DELETE FROM api_keys WHERE key = ?", key)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("DELETE FROM api_key_accounts WHERE api_key = ?", key); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM api_keys WHERE key = ?", key); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+var ErrInvalidAccountBinding = errors.New("绑定账号不存在")
+var ErrAPIKeyNotFound = errors.New("API Key 不存在")
+
+func replaceKeyBindings(tx *sql.Tx, key string, ids []string, restricted bool) error {
+	res, err := tx.Exec("UPDATE api_keys SET account_restricted = ? WHERE key = ?", restricted, key)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrAPIKeyNotFound
+	}
+	if _, err := tx.Exec("DELETE FROM api_key_accounts WHERE api_key = ?", key); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		var exists int
+		if err := tx.QueryRow("SELECT COUNT(*) FROM accounts WHERE id = ?", id).Scan(&exists); err != nil {
+			return err
+		}
+		if exists == 0 {
+			return fmt.Errorf("%w: %s", ErrInvalidAccountBinding, id)
+		}
+		if _, err := tx.Exec("INSERT OR IGNORE INTO api_key_accounts (api_key, account_id) VALUES (?, ?)", key, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *SQLiteStore) SetAPIKeyBindings(key string, ids []string) error {
+	if s == nil {
+		return errSQLiteUnavailable
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db == nil {
+		return errSQLiteUnavailable
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := replaceKeyBindings(tx, key, ids, len(ids) > 0); err != nil {
+		return err
+	}
+	return tx.Commit()
 }

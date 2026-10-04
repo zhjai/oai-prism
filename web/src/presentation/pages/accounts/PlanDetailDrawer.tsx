@@ -45,8 +45,8 @@ export const PlanDetailDrawer: React.FC = () => {
           </Descriptions.Item>
           <Descriptions.Item label="调度状态">
             <Badge
-              status={selectedAccount.enabled ? 'success' : 'error'}
-              text={selectedAccount.enabled ? '正常调度' : '已暂停'}
+              status={selectedAccount.available ? 'success' : 'warning'}
+              text={!selectedAccount.enabled ? '已停用' : selectedAccount.available ? '健康可用' : '暂不可用'}
             />
           </Descriptions.Item>
         </Descriptions>

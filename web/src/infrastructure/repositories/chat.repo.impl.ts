@@ -118,6 +118,7 @@ export class ChatRepositoryImpl implements IChatRepository {
             title: s.title,
             model: s.model,
             reasoningEffort: s.reasoning_effort,
+            accountId: s.account_id || '',
             createdAt: s.created_at,
             updatedAt: s.updated_at,
             messages: msgs,
@@ -145,6 +146,7 @@ export class ChatRepositoryImpl implements IChatRepository {
         title: session.title,
         model: session.model,
         reasoning_effort: session.reasoningEffort,
+        account_id: session.accountId || '',
       });
     } catch {
       // 网络或接口异常
@@ -194,7 +196,7 @@ export class ChatRepositoryImpl implements IChatRepository {
   }
 
   async sendMessageStream(options: SendMessageOptions): Promise<void> {
-    const { sessionId, model, reasoningEffort, content, attachments, history, onChunk, onUsage, onError, onFinish } = options;
+    const { sessionId, model, reasoningEffort, accountId, content, attachments, history, onChunk, onUsage, onError, onFinish } = options;
 
     try {
       // 组装 OpenAI 多模态消息：无附件 = 纯字符串；有附件 = text + image_url 内容块
@@ -222,6 +224,7 @@ export class ChatRepositoryImpl implements IChatRepository {
         headers: {
           'Content-Type': 'application/json',
           'X-Oaiprism-Session': sessionId,
+          ...(accountId ? { 'X-Oaiprism-Account': accountId } : {}),
           // 后端启用 APIKeyAuth 时缺失此头会 401
           ...(getApiKey() ? { Authorization: 'Bearer ' + getApiKey() } : {}),
         },
@@ -279,6 +282,20 @@ export class ChatRepositoryImpl implements IChatRepository {
 
           try {
             const parsed = JSON.parse(dataStr);
+            // The gateway reports failures after HTTP 200 as SSE error payloads.
+            // Treat them as failures before [DONE] can mark an empty run successful.
+            if (parsed.error) {
+              const err = new Error(parsed.error.message || '上游请求失败');
+              await httpClient.post(`/admin/chat/sessions/${sessionId}/messages`, {
+                id: `msg_a_${Date.now()}`,
+                role: 'assistant',
+                content: `[请求失败] ${err.message}`,
+                status: 'error',
+              }).catch(() => {});
+              onError?.(err);
+              await reader.cancel();
+              return;
+            }
             // include_usage 的收尾帧：choices 为空、只带 usage
             if (parsed.usage && (!parsed.choices || parsed.choices.length === 0)) {
               onUsage?.({

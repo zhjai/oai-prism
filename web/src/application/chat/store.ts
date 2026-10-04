@@ -12,6 +12,7 @@ interface ChatState {
   currentSessionId: string | null;
   selectedModel: string;
   reasoningEffort: ReasoningEffort;
+  selectedAccountId: string;
   isStreaming: boolean;
   lastUsage: ChatUsage | null; // 本轮 token 用量（上下文窗口可视化）
 
@@ -23,6 +24,7 @@ interface ChatState {
   renameSession: (id: string, title: string) => void;
   setModel: (model: string) => void;
   setReasoningEffort: (effort: ReasoningEffort) => void;
+  setAccount: (id: string) => void;
   sendMessage: (text: string, attachments?: ChatAttachment[]) => Promise<void>;
 }
 
@@ -33,6 +35,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   currentSessionId: null,
   selectedModel: 'gpt-6.1-sol',
   reasoningEffort: 'medium',
+  selectedAccountId: '',
   isStreaming: false,
   lastUsage: null,
 
@@ -47,6 +50,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       allModelIds: allIds,
       sessions,
       currentSessionId: defaultSessionId,
+      selectedAccountId: sessions[0]?.accountId || '',
       selectedModel: mains[0]?.id || 'gpt-6.1-sol',
       // 兜底：默认档位若不在新模型的可用列表里，回落 medium
       reasoningEffort: effortsForModel(mains[0]?.id || 'gpt-6.1-sol', allIds).includes('medium')
@@ -56,7 +60,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   selectSession: (id: string) => {
-    set({ currentSessionId: id });
+    set({ currentSessionId: id, selectedAccountId: get().sessions.find((s) => s.id === id)?.accountId || '' });
   },
 
   createNewSession: () => {
@@ -65,6 +69,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       title: '新调试会话',
       model: get().selectedModel,
       reasoningEffort: get().reasoningEffort,
+      accountId: get().selectedAccountId,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       messages: [],
@@ -78,7 +83,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     await repo.deleteSession(id);
     const sessions = get().sessions.filter((s) => s.id !== id);
     const nextId = sessions[0]?.id || null;
-    set({ sessions, currentSessionId: nextId });
+    set({ sessions, currentSessionId: nextId, selectedAccountId: sessions[0]?.accountId || '' });
   },
 
   renameSession: (id: string, title: string) => {
@@ -107,8 +112,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set({ reasoningEffort: effort });
   },
 
+  setAccount: (id: string) => {
+    const sessions = get().sessions.map((s) => s.id === get().currentSessionId ? { ...s, accountId: id } : s);
+    set({ selectedAccountId: id, sessions });
+    const updated = sessions.find((s) => s.id === get().currentSessionId);
+    if (updated) void repo.saveSession(updated);
+  },
+
   sendMessage: async (text: string, attachments?: ChatAttachment[]) => {
-    const { currentSessionId, selectedModel, reasoningEffort, sessions } = get();
+    const { currentSessionId, selectedModel, reasoningEffort, selectedAccountId, sessions } = get();
     if (!text.trim() || !currentSessionId) return;
 
     const session = sessions.find((s) => s.id === currentSessionId);
@@ -153,6 +165,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       attachments,
       model: selectedModel,
       reasoningEffort,
+      accountId: selectedAccountId,
       // 上游不代管对话历史：把既有消息（历史轮）回传给网关拼进上下文。
       // 只取到 userMsg 为止，不含 assistantMsg 占位（它此刻还是空的）。
       history: [...session.messages],

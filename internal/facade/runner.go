@@ -319,13 +319,13 @@ func (r *Runner) Run(ctx context.Context, req *RunRequest, emit func(Delta) erro
 // acquire 选账号。
 func (r *Runner) acquire(ctx context.Context, req *RunRequest) (*account.Lease, error) {
 	if req.AccountID != "" {
-		if a := r.pool.Get(req.AccountID); a != nil {
-			if a.Acquire(time.Now()) {
-				r.app.AccountPick.Inc("pinned")
-				return &account.Lease{Account: a}, nil
-			}
+		lease, err := r.pool.AcquirePinned(ctx, req.AccountID)
+		if err != nil {
 			r.app.AccountPick.Inc("pinned_busy")
+			return nil, err
 		}
+		r.app.AccountPick.Inc("pinned")
+		return lease, nil
 	}
 	lease, err := r.pool.Acquire(ctx, req.StickyKey)
 	if err != nil {
