@@ -170,36 +170,36 @@ type CredsConfig struct {
 //	AccessToken   - 直接给 JWT（chatgpt accessToken）
 //	RefreshToken  - 给 OAuth refresh_token，由代理自动换 accessToken
 type AccountConfig struct {
-	ID      string `yaml:"id"`
-	Name    string `yaml:"name"`
-	Enabled *bool  `yaml:"enabled"` // 指针以便区分"未设置"与"显式 false"
+	ID      string `yaml:"id" json:"id"`
+	Name    string `yaml:"name" json:"name"`
+	Enabled *bool  `yaml:"enabled" json:"enabled"` // 指针以便区分"未设置"与"显式 false"
 
-	Cookies      string            `yaml:"cookies"`
-	CookieMap    map[string]string `yaml:"cookie_map"`
-	SessionToken string            `yaml:"session_token"`
-	AccessToken  string            `yaml:"access_token"`
-	RefreshToken string            `yaml:"refresh_token"`
-	ExpiresAt    *time.Time        `yaml:"expires_at"`
+	Cookies      string            `yaml:"cookies" json:"cookies"`
+	CookieMap    map[string]string `yaml:"cookie_map" json:"cookie_map"`
+	SessionToken string            `yaml:"session_token" json:"session_token"`
+	AccessToken  string            `yaml:"access_token" json:"access_token"`
+	RefreshToken string            `yaml:"refresh_token" json:"refresh_token"`
+	ExpiresAt    *time.Time        `yaml:"expires_at" json:"expires_at"`
 
-	AccountID string `yaml:"account_id"`
-	Email     string `yaml:"email"`
-	Plan      string `yaml:"plan"`
+	AccountID string `yaml:"account_id" json:"account_id"`
+	Email     string `yaml:"email" json:"email"`
+	Plan      string `yaml:"plan" json:"plan"`
 
 	// 网络出口。留空走 Upstream.HTTPProxy。
-	Proxy string `yaml:"proxy"`
+	Proxy string `yaml:"proxy" json:"proxy"`
 
 	// 单账号并发上限。Prism 对同一账号并发比较敏感，默认保守。
-	MaxConcurrency int `yaml:"max_concurrency"`
+	MaxConcurrency int `yaml:"max_concurrency" json:"max_concurrency"`
 
 	// 速率限制：每秒补充 tokens 个令牌，桶容量 burst。
-	RatePerSecond float64 `yaml:"rate_per_second"`
-	RateBurst     int     `yaml:"rate_burst"`
+	RatePerSecond float64 `yaml:"rate_per_second" json:"rate_per_second"`
+	RateBurst     int     `yaml:"rate_burst" json:"rate_burst"`
 
 	// Weight 用于加权轮询。
-	Weight int `yaml:"weight"`
+	Weight int `yaml:"weight" json:"weight"`
 
-	Headers map[string]string `yaml:"headers"`
-	Tags    []string          `yaml:"tags"`
+	Headers map[string]string `yaml:"headers" json:"headers"`
+	Tags    []string          `yaml:"tags" json:"tags"`
 }
 
 // IsEnabled 处理 *bool 的三态。

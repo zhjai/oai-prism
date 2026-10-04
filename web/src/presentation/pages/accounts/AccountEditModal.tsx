@@ -12,7 +12,7 @@ export const AccountEditModal: React.FC = () => {
         name: editingAccount.name,
         email: editingAccount.email,
         plan: editingAccount.plan || 'pro',
-        max_concurrency: editingAccount.max_concurrency || 2,
+        max_concurrency: editingAccount.max_concurrency ?? 2,
       });
     }
   }, [editingAccount, form]);
@@ -53,9 +53,11 @@ export const AccountEditModal: React.FC = () => {
           <Input placeholder="user@example.com" />
         </Form.Item>
 
-        <Form.Item name="plan" label="上游计划等级">
+        <Form.Item name="plan" label="计划等级（本地标记）" extra="不改变上游订阅或额度">
           <Select
             options={[
+              { value: 'plus', label: 'Plus 计划' },
+              { value: 'prolite', label: 'Pro Lite 计划' },
               { value: 'pro', label: 'Pro 计划' },
               { value: 'team', label: 'Team 计划' },
               { value: 'enterprise', label: 'Enterprise 计划' },

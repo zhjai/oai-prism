@@ -39,7 +39,7 @@ case "$(uname -m)" in
   aarch64|arm64) arch=arm64 ;;
   *) echo "不支持的架构：$(uname -m)"; exit 1 ;;
 esac
-version=v0.1.0-zhjai.1
+version=v0.1.0-zhjai.2
 asset="oaiprism-${version}-linux-${arch}.tar.gz"
 url="https://github.com/zhjai/oai-prism/releases/download/${version}"
 curl -fLO "${url}/${asset}"
@@ -86,7 +86,7 @@ cd ..
 ```
 
 交叉编译：`make build-linux` 生成 `bin/oaiprism-linux-amd64` 和 `bin/oaiprism-linux-arm64`。
-生成与 Release 相同的完整安装包：`./tools/package_linux.sh v0.1.0-zhjai.1`，输出在 `dist/`。
+生成与 Release 相同的完整安装包：`./tools/package_linux.sh v0.1.0-zhjai.2`，输出在 `dist/`。
 
 如果后续使用本教程提供的 systemd 单元，请把完整运行目录放到 `~/.local/share/oaiprism`，
 或按实际位置修改单元的 `WorkingDirectory` 和 `ExecStart`。
@@ -157,6 +157,10 @@ curl -N http://127.0.0.1:8787/v1/chat/completions \
 ```
 
 客户端接入配置见 [README](../README.md#接入客户端) 和 [使用指南](使用指南.md#接入客户端)。
+
+账号编辑中的「计划等级」是保存在本地的标记，不改变上游订阅或额度。
+「最大并发槽位」保存后立即用于调度，`0` 表示不限；刷新网页、重载凭据和重启后仍保留。
+凭据文件更新时会导入新账号、更新已有账号的 Cookie/Token，已有账号的展示信息和并发设置以 Dashboard 为准。
 
 ## 远程服务器访问
 

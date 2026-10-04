@@ -382,15 +382,16 @@ func (s *Server) completeOAuthLogin(sess *oauthSession, code string) (string, er
 	}
 
 	acct := config.AccountConfig{
-		ID:           "oauth-" + oauthRandomHex(4),
-		Name:         "OAuth 导入",
-		Enabled:      boolPtr(true),
-		AccessToken:  tok.AccessToken,
-		RefreshToken: tok.RefreshToken,
-		ExpiresAt:    &expires,
-		Email:        email,
-		Plan:         "pro",
-		Tags:         []string{"oauth"},
+		ID:             "oauth-" + oauthRandomHex(4),
+		Name:           "OAuth 导入",
+		Enabled:        boolPtr(true),
+		AccessToken:    tok.AccessToken,
+		RefreshToken:   tok.RefreshToken,
+		ExpiresAt:      &expires,
+		Email:          email,
+		Plan:           "pro",
+		MaxConcurrency: 2,
+		Tags:           []string{"oauth"},
 		// refresh_token 与签发它的 client 绑定：导入用的哪个 client，
 		// 这个账号的刷新也必须用哪个 —— 逐账号记录，避免全局混用。
 		Headers: map[string]string{"oauth_client_id": sess.ClientID},

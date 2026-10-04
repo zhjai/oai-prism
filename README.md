@@ -106,7 +106,7 @@ case "$(uname -m)" in
   aarch64|arm64) arch=arm64 ;;
   *) echo "不支持的架构：$(uname -m)"; exit 1 ;;
 esac
-version=v0.1.0-zhjai.1
+version=v0.1.0-zhjai.2
 asset="oaiprism-${version}-linux-${arch}.tar.gz"
 url="https://github.com/zhjai/oai-prism/releases/download/${version}"
 curl -fLO "${url}/${asset}"
@@ -320,7 +320,7 @@ cd web && pnpm install && npx tsc --noEmit && pnpm build
 - CI 在任意分支 push / PR 时运行 Go 门禁（vet → test → race → 构建 → 交叉编译 linux/amd64、arm64）
   与 Dashboard 门禁（tsc → vite build）。
 - 推送 `v*` 标签触发 Release 工作流：完成 Go 与 Dashboard 门禁后，为 Linux amd64/arm64 打包并生成 `SHA256SUMS`。
-  本地等价打包命令：`./tools/package_linux.sh v0.1.0-zhjai.1`，产物位于 `dist/`。
+  本地等价打包命令：`./tools/package_linux.sh v0.1.0-zhjai.2`，产物位于 `dist/`。
 
 欢迎提交 Issue 与 Pull Request。较大的改动请先开 Issue 讨论方向。
 

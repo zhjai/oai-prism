@@ -137,7 +137,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
             cookies: item.cookies || item.cookie || '',
             access_token: item.accessToken || item.access_token || '',
             refresh_token: item.refreshToken || item.refresh_token || '',
-            max_concurrency: item.maxConcurrency || item.max_concurrency || 2,
+            max_concurrency: item.maxConcurrency ?? item.max_concurrency ?? 2,
           });
         }
       } catch {

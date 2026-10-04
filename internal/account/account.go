@@ -23,6 +23,7 @@ type Account struct {
 	Name   string
 	Tags   []string
 	Weight int
+	plan   string // Local plan label; refreshed upstream claims remain in the credential.
 
 	// Client 是该账号专属的上游客户端（可能走独立出口代理）。
 	Client *httpc.Client
@@ -212,6 +213,7 @@ func (a *Account) Stats(now time.Time) Stats {
 	s := Stats{
 		ID:         a.ID,
 		Name:       a.Name,
+		Plan:       a.plan,
 		Enabled:    a.Available(now),
 		Inflight:   a.inflight.Load(),
 		MaxConcur:  a.maxConc,
@@ -224,7 +226,9 @@ func (a *Account) Stats(now time.Time) Stats {
 		s.CooldownSec = d.Seconds()
 	}
 	if c != nil {
-		s.Plan = c.Plan
+		if s.Plan == "" {
+			s.Plan = c.Plan
+		}
 		s.Email = c.Email
 		s.Source = c.Source
 		s.HasToken = c.AccessToken != ""
@@ -248,6 +252,7 @@ func newAccount(cfg config.AccountConfig, client *httpc.Client, c *creds.Credent
 		Name:    cfg.Name,
 		Tags:    cfg.Tags,
 		Weight:  cfg.Weight,
+		plan:    cfg.Plan,
 		Client:  client,
 		maxConc: int64(cfg.MaxConcurrency),
 	}

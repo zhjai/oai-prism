@@ -373,25 +373,37 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 			return
 		}
 
-		var single config.AccountConfig
-		var batch []config.AccountConfig
-
-		if err := json.Unmarshal(body, &batch); err != nil {
-			if err2 := json.Unmarshal(body, &single); err2 != nil {
+		var rawAccounts []json.RawMessage
+		if err := json.Unmarshal(body, &rawAccounts); err != nil {
+			rawAccounts = []json.RawMessage{body}
+		}
+		batch := make([]config.AccountConfig, 0, len(rawAccounts))
+		for _, raw := range rawAccounts {
+			a := config.AccountConfig{MaxConcurrency: 2}
+			if err := json.Unmarshal(raw, &a); err != nil {
 				writeAdminErr(w, http.StatusBadRequest, "请求体需为账号对象或账号数组: "+err.Error())
 				return
 			}
-			batch = []config.AccountConfig{single}
+			if a.MaxConcurrency < 0 {
+				writeAdminErr(w, http.StatusBadRequest, "最大并发槽位不能为负数")
+				return
+			}
+			batch = append(batch, a)
 		}
 
-		if s.sqlite != nil {
-			for _, a := range batch {
-				if err := s.sqlite.SaveAccount(a); err != nil {
-					writeAdminErr(w, http.StatusInternalServerError, "保存至 SQLite 失败: "+err.Error())
-					return
-				}
+		if s.sqlite == nil {
+			writeAdminErr(w, http.StatusServiceUnavailable, "SQLite 账号存储不可用")
+			return
+		}
+		for _, a := range batch {
+			if err := s.sqlite.SaveAccount(a); err != nil {
+				writeAdminErr(w, http.StatusInternalServerError, "保存至 SQLite 失败: "+err.Error())
+				return
 			}
-			_ = s.syncPoolFromSQLite()
+		}
+		if err := s.syncPoolFromSQLite(); err != nil {
+			writeAdminErr(w, http.StatusInternalServerError, "重建账号池失败: "+err.Error())
+			return
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -432,19 +444,42 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 			return
 		}
 
+		if s.sqlite == nil {
+			writeAdminErr(w, http.StatusServiceUnavailable, "SQLite 账号存储不可用")
+			return
+		}
+		list, err := s.sqlite.Load()
+		if err != nil {
+			writeAdminErr(w, http.StatusInternalServerError, "读取 SQLite 失败: "+err.Error())
+			return
+		}
 		var update config.AccountConfig
+		for _, a := range list {
+			if a.ID == id {
+				update = a
+				break
+			}
+		}
+		if update.ID == "" {
+			writeAdminErr(w, http.StatusNotFound, "账号不存在: "+id)
+			return
+		}
 		if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
 			writeAdminErr(w, http.StatusBadRequest, "解析修改数据失败: "+err.Error())
 			return
 		}
 		update.ID = id
-
-		if s.sqlite != nil {
-			if err := s.sqlite.SaveAccount(update); err != nil {
-				writeAdminErr(w, http.StatusInternalServerError, "更新 SQLite 失败: "+err.Error())
-				return
-			}
-			_ = s.syncPoolFromSQLite()
+		if update.MaxConcurrency < 0 {
+			writeAdminErr(w, http.StatusBadRequest, "最大并发槽位不能为负数")
+			return
+		}
+		if err := s.sqlite.SaveAccount(update); err != nil {
+			writeAdminErr(w, http.StatusInternalServerError, "更新 SQLite 失败: "+err.Error())
+			return
+		}
+		if err := s.syncPoolFromSQLite(); err != nil {
+			writeAdminErr(w, http.StatusInternalServerError, "重建账号池失败: "+err.Error())
+			return
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -484,9 +519,16 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 			writeAdminErr(w, http.StatusBadRequest, "读取凭据文件失败: "+err.Error())
 			return
 		}
-		if err := s.pool.Build(mergeAccounts(s.cfg.Creds.Accounts, list)); err != nil {
-			writeAdminErr(w, http.StatusInternalServerError, "重建账号池失败: "+err.Error())
-			return
+		if s.sqlite != nil {
+			if err := s.syncPoolFromFile(list); err != nil {
+				writeAdminErr(w, http.StatusInternalServerError, "重建账号池失败: "+err.Error())
+				return
+			}
+		} else {
+			if err := s.pool.Build(mergeAccounts(s.cfg.Creds.Accounts, list)); err != nil {
+				writeAdminErr(w, http.StatusInternalServerError, "重建账号池失败: "+err.Error())
+				return
+			}
 		}
 		s.log.Info("凭据已手动重载", "count", s.pool.Size())
 		w.Header().Set("Content-Type", "application/json")
@@ -951,6 +993,12 @@ func (s *Server) Run(ctx context.Context) error {
 	s.pool.StartBackground(bgCtx)
 	if s.cfg.Creds.Mode == "file" || s.cfg.Creds.Mode == "hybrid" {
 		go s.store.Watch(bgCtx, s.cfg.Creds.ReloadInterval, func(list []config.AccountConfig) {
+			if s.sqlite != nil {
+				if err := s.syncPoolFromFile(list); err != nil {
+					s.log.Error("热重载账号池失败，保留原池", "err", err)
+				}
+				return
+			}
 			if err := s.pool.Build(mergeAccounts(s.cfg.Creds.Accounts, list)); err != nil {
 				s.log.Error("热重载账号池失败，保留原池", "err", err)
 			}
@@ -1052,6 +1100,31 @@ func (s *Server) Close() error {
 		return s.srv.Close()
 	}
 	return nil
+}
+
+// Import file credentials without replacing settings already edited in the Dashboard.
+func (s *Server) syncPoolFromFile(list []config.AccountConfig) error {
+	stored, err := s.sqlite.Load()
+	if err != nil {
+		return err
+	}
+	byID := make(map[string]config.AccountConfig, len(stored))
+	for _, a := range stored {
+		byID[a.ID] = a
+	}
+	for _, a := range list {
+		if current, ok := byID[a.ID]; ok {
+			a.Name = current.Name
+			a.Email = current.Email
+			a.Plan = current.Plan
+			a.MaxConcurrency = current.MaxConcurrency
+			a.Tags = current.Tags
+		}
+		if err := s.sqlite.SaveAccount(a); err != nil {
+			return err
+		}
+	}
+	return s.syncPoolFromSQLite()
 }
 
 // syncPoolFromSQLite 从 SQLite 读取全量账号并重新热加载至账号池。

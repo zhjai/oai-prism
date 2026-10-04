@@ -248,8 +248,8 @@ func (s *SQLiteStore) SaveAccount(a config.AccountConfig) error {
 	if strings.TrimSpace(a.Plan) == "" {
 		a.Plan = "pro"
 	}
-	if a.MaxConcurrency <= 0 {
-		a.MaxConcurrency = 2
+	if a.MaxConcurrency < 0 {
+		return fmt.Errorf("最大并发槽位不能为负数")
 	}
 
 	tagsJSON := "[]"
