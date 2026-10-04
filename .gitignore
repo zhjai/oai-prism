@@ -1,5 +1,6 @@
 # 编译产物
 bin/
+/dist/
 *.exe
 # 仅忽略仓库根目录的 Linux 二进制 —— 必须带前导斜杠：
 # 无斜杠的 `oaiprism` 会连 cmd/oaiprism/ 源码目录一起忽略

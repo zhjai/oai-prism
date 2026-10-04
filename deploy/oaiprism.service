@@ -1,0 +1,18 @@
+[Unit]
+Description=OAIprism API gateway
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=%h/.local/share/oaiprism/configs/config.yaml
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/oaiprism
+ExecStart=%h/.local/share/oaiprism/oaiprism serve -config configs/config.yaml
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

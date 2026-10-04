@@ -1,0 +1,64 @@
+name: Linux Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Go checks
+        run: |
+          go vet ./...
+          go test ./...
+          go test -race ./...
+      - name: Build Dashboard
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec tsc --noEmit
+          pnpm build
+      - name: Check Linux scripts
+        run: |
+          bash -n tools/start.sh tools/package_linux.sh tools/check_linux_package.sh
+          shellcheck tools/start.sh tools/package_linux.sh tools/check_linux_package.sh
+      - name: Package Linux releases
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: bash tools/package_linux.sh "$RELEASE_TAG"
+      - name: Verify native Linux package
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
+          sha256sum --check SHA256SUMS
+          cd ..
+          bash tools/check_linux_package.sh "dist/oaiprism-${RELEASE_TAG}-linux-amd64.tar.gz" "$RELEASE_TAG"
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" dist/*.tar.gz dist/SHA256SUMS \
+            --verify-tag --title "OAIprism ${RELEASE_TAG} - Linux" --generate-notes

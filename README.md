@@ -12,7 +12,8 @@
 </p>
 
 <p>
-  <a href="https://github.com/alanbulan/oai-prism/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/alanbulan/oai-prism/ci.yml?branch=master&style=flat-square&label=CI&logo=githubactions&logoColor=white" alt="CI"></a>
+  <a href="https://github.com/zhjai/oai-prism/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/zhjai/oai-prism/ci.yml?branch=master&style=flat-square&label=CI&logo=githubactions&logoColor=white" alt="CI"></a>
+  <a href="https://github.com/zhjai/oai-prism/releases/latest"><img src="https://img.shields.io/github/v/release/zhjai/oai-prism?style=flat-square" alt="Release"></a>
   <a href="go.mod"><img src="https://img.shields.io/github/go-mod/go-version/alanbulan/oai-prism?style=flat-square&logo=go&logoColor=white&color=00ADD8" alt="Go"></a>
   <a href="web/package.json"><img src="https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react&logoColor=white" alt="React 19"></a>
   <img src="https://img.shields.io/badge/CGO-free-4f46e5?style=flat-square" alt="CGO free">
@@ -30,10 +31,11 @@
 
 <p>
   <a href="#快速开始">快速开始</a> ·
+  <a href="docs/Linux部署指南.md">Linux 教程</a> ·
   <a href="docs/使用指南.md">使用指南</a> ·
   <a href="docs/架构与原理.md">架构与原理</a> ·
   <a href="#控制台">控制台</a> ·
-  <a href="https://github.com/alanbulan/oai-prism/issues">反馈问题</a>
+  <a href="https://github.com/zhjai/oai-prism/issues">反馈问题</a>
 </p>
 
 <br>
@@ -87,11 +89,70 @@ OAIprism 把这些全部收进网关，对外只暴露你已经在用的标准�
 
 ## 快速开始
 
-> 只需要 Go 1.26+（构建用）。运行时是单个进程、单个端口，不需要 Node.js 或浏览器。
-> 以下命令以 Windows PowerShell 为例，其它平台的启动方式见[使用指南](docs/使用指南.md#安装与启动)。
+本 fork 基于 [alanbulan/oai-prism](https://github.com/alanbulan/oai-prism)，增加 Linux 教程、启动脚本和 Release 安装包。
+Linux 与 Windows 都只运行一个 Go 进程，监听 8787；不需要 Node.js、Chrome、图形桌面或旧版的 8790/8791 服务。
+默认浏览器指纹中的 `Windows` 是出站协议模拟，与运行网关的操作系统无关，Linux 无需修改它。
+
+### Linux：下载 Release（推荐）
+
+安装包支持 `linux/amd64`（x86_64）和 `linux/arm64`（aarch64），包含二进制、Dashboard、配置示例和启动脚本。
+运行预编译版本不需要 Go、Node.js 或 pnpm。先准备 `curl`、`tar`、`sha256sum` 和系统 CA 证书
+（Debian/Ubuntu：`sudo apt-get install ca-certificates curl tar coreutils`）。
+
+```bash
+# 选择本机架构并下载；升级时也可以在 Release 页面选择新的版本号
+case "$(uname -m)" in
+  x86_64) arch=amd64 ;;
+  aarch64|arm64) arch=arm64 ;;
+  *) echo "不支持的架构：$(uname -m)"; exit 1 ;;
+esac
+version=v0.1.0-zhjai.1
+asset="oaiprism-${version}-linux-${arch}.tar.gz"
+url="https://github.com/zhjai/oai-prism/releases/download/${version}"
+curl -fLO "${url}/${asset}"
+curl -fLO "${url}/SHA256SUMS"
+sha256sum --check --ignore-missing SHA256SUMS
+
+# 使用固定目录，便于后续配置 systemd
+mkdir -p "$HOME/.local/share/oaiprism"
+tar -xzf "$asset" -C "$HOME/.local/share/oaiprism" --strip-components=1
+cd "$HOME/.local/share/oaiprism"
+./oaiprism version
+
+# 从标准输入粘贴 prism.openai.com 的整串 Cookie，按 Ctrl+D 结束
+./oaiprism import -stdin -id main
+
+# 前台启动；首次自动创建 configs/config.yaml，Ctrl+C 停止
+./tools/start.sh
+```
+
+也可以不预先导入账号，直接启动后在 Dashboard 的「账号与计划池」中通过 OAuth 导入。
+服务器上运行时，在自己的电脑建立 SSH 隧道，再访问本机 Dashboard：
+
+```bash
+ssh -N -L 8787:127.0.0.1:8787 user@your-server
+```
+
+完整的 [Linux 部署指南](docs/Linux部署指南.md) 包含凭据导入、systemd 常驻、日志、诊断和升级回滚。
+
+### Linux：从源码构建
+
+需要 **Go 1.26+**；仓库已包含 Dashboard 构建产物，未修改前端时不需要 pnpm。
+
+```bash
+git clone https://github.com/zhjai/oai-prism.git
+cd oai-prism
+go build -trimpath -o oaiprism ./cmd/oaiprism
+./oaiprism import -stdin -id main
+./tools/start.sh
+```
+
+### Windows PowerShell
+
+从源码构建需要 Go 1.26+。
 
 ```powershell
-git clone https://github.com/alanbulan/oai-prism.git
+git clone https://github.com/zhjai/oai-prism.git
 cd oai-prism
 
 # 1. 编译
@@ -237,6 +298,7 @@ flowchart LR
 
 | 文档 | 内容 |
 |---|---|
+| [Linux 部署指南](docs/Linux部署指南.md) | Release 安装、源码构建、账号导入、SSH 隧道、systemd、日志与升级回滚 |
 | [使用指南](docs/使用指南.md) | 安装启动、鉴权与 API Key、客户端接入、端点与控制头、运维配置、部署回滚 |
 | [架构与原理](docs/架构与原理.md) | 系统架构、多轮上下文、工具桥、上游协议、沙箱、安全与性能设计、目录结构 |
 | [协议校准报告](docs/协议校准报告.md) | 上游推理协议的实测字段与行为 |
@@ -257,6 +319,8 @@ cd web && pnpm install && npx tsc --noEmit && pnpm build
   **真实执行**合成补丁脚本、逐字节核对落盘结果的回归测试；
 - CI 在任意分支 push / PR 时运行 Go 门禁（vet → test → race → 构建 → 交叉编译 linux/amd64、arm64）
   与 Dashboard 门禁（tsc → vite build）。
+- 推送 `v*` 标签触发 Release 工作流：完成 Go 与 Dashboard 门禁后，为 Linux amd64/arm64 打包并生成 `SHA256SUMS`。
+  本地等价打包命令：`./tools/package_linux.sh v0.1.0-zhjai.1`，产物位于 `dist/`。
 
 欢迎提交 Issue 与 Pull Request。较大的改动请先开 Issue 讨论方向。
 
