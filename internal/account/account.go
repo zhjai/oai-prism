@@ -1,6 +1,7 @@
 package account
 
 import (
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -64,6 +65,15 @@ type accountRuntime struct {
 	// refreshing 保证同一账号同一时刻只有一次刷新在飞。
 	refreshMu   sync.Mutex
 	refreshCall *refreshCall
+
+	// Refresh scheduling state is kept with the runtime so metadata-only
+	// configuration reloads do not reset an in-flight refresh lease or its
+	// backoff. Pointers identify immutable credential snapshots.
+	refreshFailureCred  *creds.Credential
+	refreshFailureUntil time.Time
+	refreshFailureCount int
+	refreshSuccessCred  *creds.Credential
+	refreshSuccessUntil time.Time
 }
 
 type refreshCall struct {
@@ -76,7 +86,187 @@ type refreshCall struct {
 func (a *Account) Credential() *creds.Credential { return a.cred.Load() }
 
 // StoreCredential 原子替换凭据。
-func (a *Account) StoreCredential(c *creds.Credential) { a.cred.Store(c) }
+func (a *Account) StoreCredential(c *creds.Credential) {
+	a.refreshMu.Lock()
+	defer a.refreshMu.Unlock()
+	old := a.cred.Swap(c)
+	if credentialMaterialChanged(old, c) {
+		a.refreshFailureCred = nil
+		a.refreshFailureUntil = time.Time{}
+		a.refreshFailureCount = 0
+		a.refreshSuccessCred = nil
+		a.refreshSuccessUntil = time.Time{}
+		return
+	}
+	// A metadata-only reload replaces the immutable snapshot pointer. Carry
+	// scheduling state forward so it still applies to the equivalent material.
+	if a.refreshFailureCred == old {
+		a.refreshFailureCred = c
+	}
+	if a.refreshSuccessCred == old {
+		a.refreshSuccessCred = c
+	}
+}
+
+func credentialMaterialChanged(old, next *creds.Credential) bool {
+	if old == nil || next == nil {
+		return old != next
+	}
+	return old.AccessToken != next.AccessToken ||
+		old.RefreshToken != next.RefreshToken ||
+		old.SessionToken != next.SessionToken ||
+		old.SessionCookieName != next.SessionCookieName ||
+		old.Headers["oauth_client_id"] != next.Headers["oauth_client_id"] ||
+		credentialIdentityCookies(old.CookieHeader) != credentialIdentityCookies(next.CookieHeader)
+}
+
+func credentialIdentityCookies(header string) string {
+	var result strings.Builder
+	for _, name := range []string{creds.CookiePrismAccessToken, creds.CookiePrismRefreshToken, creds.CookiePrismSessionToken, creds.CookieSessionToken, creds.CookieSessionTokenLoose, creds.CookieAuthSession} {
+		result.WriteString(name)
+		result.WriteByte('=')
+		result.WriteString(creds.CookieValue(header, name))
+		result.WriteByte(';')
+	}
+	return result.String()
+}
+
+// mergeRefreshCredential preserves operator edits while applying refresh changes
+// to fields that still match the snapshot used by the upstream request.
+func mergeRefreshCredential(current, expected, next *creds.Credential) *creds.Credential {
+	merged := current.Clone()
+	merged.AccessToken, merged.RefreshToken = next.AccessToken, next.RefreshToken
+	merged.Source, merged.UpdatedAt = next.Source, next.UpdatedAt
+	for _, field := range []struct {
+		dst        *string
+		old, value string
+	}{
+		{&merged.SessionToken, expected.SessionToken, next.SessionToken},
+		{&merged.SessionCookieName, expected.SessionCookieName, next.SessionCookieName},
+		{&merged.AccountID, expected.AccountID, next.AccountID},
+		{&merged.Email, expected.Email, next.Email},
+		{&merged.Plan, expected.Plan, next.Plan},
+		{&merged.UserID, expected.UserID, next.UserID},
+	} {
+		if *field.dst == field.old {
+			*field.dst = field.value
+		}
+	}
+	if current.ExpiresAt.Equal(expected.ExpiresAt) {
+		merged.ExpiresAt = next.ExpiresAt
+	}
+	for key, old := range expected.Headers {
+		if value, ok := merged.Headers[key]; ok && value == old {
+			if value, ok := next.Headers[key]; ok {
+				merged.Headers[key] = value
+			} else {
+				delete(merged.Headers, key)
+			}
+		}
+	}
+	for key, value := range next.Headers {
+		if _, existed := expected.Headers[key]; existed {
+			continue
+		}
+		if _, exists := merged.Headers[key]; !exists {
+			if merged.Headers == nil {
+				merged.Headers = make(map[string]string)
+			}
+			merged.Headers[key] = value
+		}
+	}
+	if canonicalCredentialCookies(current.CookieHeader) == canonicalCredentialCookies(expected.CookieHeader) {
+		merged.CookieHeader = next.CookieHeader
+	} else {
+		request := &http.Request{Header: http.Header{"Cookie": []string{next.CookieHeader}}}
+		for _, cookie := range request.Cookies() {
+			old := creds.CookieValue(expected.CookieHeader, cookie.Name)
+			if cookie.Value != old && creds.CookieValue(current.CookieHeader, cookie.Name) == old {
+				merged.CookieHeader = creds.MergeCookie(merged.CookieHeader, cookie)
+			}
+		}
+	}
+	return merged
+}
+
+func (a *Account) refreshBlocked(c *creds.Credential, now time.Time) bool {
+	a.refreshMu.Lock()
+	defer a.refreshMu.Unlock()
+	if a.refreshFailureCred == c && now.Before(a.refreshFailureUntil) {
+		return true
+	}
+	return a.refreshSuccessCred == c && now.Before(a.refreshSuccessUntil)
+}
+
+func (a *Account) refreshRetryAt(c *creds.Credential) (time.Time, bool) {
+	a.refreshMu.Lock()
+	defer a.refreshMu.Unlock()
+	if a.refreshFailureCred != c || a.refreshFailureUntil.IsZero() {
+		return time.Time{}, false
+	}
+	return a.refreshFailureUntil, true
+}
+
+func (a *Account) refreshSuccessAt(c *creds.Credential) (time.Time, bool) {
+	a.refreshMu.Lock()
+	defer a.refreshMu.Unlock()
+	if a.refreshSuccessCred != c || a.refreshSuccessUntil.IsZero() {
+		return time.Time{}, false
+	}
+	return a.refreshSuccessUntil, true
+}
+
+func (a *Account) noteRefreshFailure(c *creds.Credential, now time.Time, interval time.Duration) {
+	if interval <= 0 {
+		interval = 10 * time.Minute
+	}
+	a.refreshMu.Lock()
+	defer a.refreshMu.Unlock()
+	if a.Credential() != c {
+		return
+	}
+	if a.refreshFailureCred != c {
+		a.refreshFailureCred = c
+		a.refreshFailureCount = 0
+	}
+	a.refreshFailureCount++
+	delay := time.Minute
+	for i := 1; i < a.refreshFailureCount && delay < interval; i++ {
+		delay *= 2
+	}
+	if delay > interval {
+		delay = interval
+	}
+	a.refreshFailureUntil = now.Add(delay)
+	a.refreshSuccessCred = nil
+	a.refreshSuccessUntil = time.Time{}
+}
+
+func (a *Account) noteRefreshSuccess(c *creds.Credential, now time.Time, interval, skew time.Duration) {
+	if interval <= 0 {
+		interval = 10 * time.Minute
+	}
+	a.refreshMu.Lock()
+	if a.Credential() != c {
+		a.refreshMu.Unlock()
+		return
+	}
+	a.refreshFailureCred = nil
+	a.refreshFailureUntil = time.Time{}
+	a.refreshFailureCount = 0
+	a.refreshSuccessCred = c
+	delay := interval
+	if c.Usable() && !c.Expired(now) {
+		if !c.NeedsRefresh(now, skew) && delay > 30*time.Second {
+			delay = 30 * time.Second
+		}
+		if remaining := c.ExpiresAt.Sub(now); remaining > 0 && remaining/2 < delay {
+			delay = remaining / 2
+		}
+	}
+	a.refreshSuccessUntil = now.Add(delay)
+	a.refreshMu.Unlock()
+}
 
 // Inflight 当前在途请求数。
 func (a *Account) Inflight() int64 { return a.inflight.Load() }

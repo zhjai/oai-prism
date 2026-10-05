@@ -25,6 +25,7 @@ type ChatChunkSpec struct {
 	Role      string
 	Content   string
 	Reasoning string
+	Progress  string
 	Finish    string
 	HasFinish bool
 	ToolCalls []ToolCall
@@ -70,6 +71,14 @@ func AppendChatChunk(dst []byte, s ChatChunkSpec) []byte {
 			// （DeepSeek / vLLM / 各类客户端都认），用来承载思维链。
 			dst = append(dst, `"reasoning_content":`...)
 			dst = sse.AppendJSONString(dst, s.Reasoning)
+			first = false
+		}
+		if s.Progress != "" {
+			if !first {
+				dst = append(dst, ',')
+			}
+			dst = append(dst, `"progress_content":`...)
+			dst = sse.AppendJSONString(dst, s.Progress)
 			first = false
 		}
 		if len(s.ToolCalls) > 0 {
@@ -203,14 +212,15 @@ func AppendAnthropicEvent(dst []byte, e AnthropicEvent) []byte {
 
 // ResponsesEvent 是 /v1/responses 流式事件的编码输入。
 type ResponsesEvent struct {
-	Type       string
-	ResponseID string
-	Model      string
-	CreatedAt  int64
-	ItemID     string
-	Text       string
-	Status     string
-	Usage      *prism.Usage
+	Type        string
+	OutputIndex int
+	ResponseID  string
+	Model       string
+	CreatedAt   int64
+	ItemID      string
+	Text        string
+	Status      string
+	Usage       *prism.Usage
 
 	// ItemJSON / OutputJSON 供工具桥输出非 message 形状的条目
 	// （如 custom_tool_call）：直接内嵌完整 JSON，避免为每种
@@ -239,49 +249,65 @@ func AppendResponsesEvent(dst []byte, e ResponsesEvent) []byte {
 
 	case "response.output_item.added":
 		if e.ItemJSON != "" {
-			dst = append(dst, `{"type":"response.output_item.added","output_index":0,"item":`...)
+			dst = append(dst, `{"type":"response.output_item.added","output_index":`...)
+			dst = sse.AppendInt(dst, int64(e.OutputIndex))
+			dst = append(dst, `,"item":`...)
 			dst = append(dst, e.ItemJSON...)
 			dst = append(dst, '}')
 			break
 		}
-		dst = append(dst, `{"type":"response.output_item.added","output_index":0,"item":{"id":`...)
+		dst = append(dst, `{"type":"response.output_item.added","output_index":`...)
+		dst = sse.AppendInt(dst, int64(e.OutputIndex))
+		dst = append(dst, `,"item":{"id":`...)
 		dst = sse.AppendJSONString(dst, e.ItemID)
 		dst = append(dst, `,"type":"message","status":"in_progress","role":"assistant","content":[]}}`...)
 
 	case "response.content_part.added":
 		dst = append(dst, `{"type":"response.content_part.added","item_id":`...)
 		dst = sse.AppendJSONString(dst, e.ItemID)
-		dst = append(dst, `,"output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}`...)
+		dst = append(dst, `,"output_index":`...)
+		dst = sse.AppendInt(dst, int64(e.OutputIndex))
+		dst = append(dst, `,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}`...)
 
 	case "response.output_text.delta":
 		dst = append(dst, `{"type":"response.output_text.delta","item_id":`...)
 		dst = sse.AppendJSONString(dst, e.ItemID)
-		dst = append(dst, `,"output_index":0,"content_index":0,"delta":`...)
+		dst = append(dst, `,"output_index":`...)
+		dst = sse.AppendInt(dst, int64(e.OutputIndex))
+		dst = append(dst, `,"content_index":0,"delta":`...)
 		dst = sse.AppendJSONString(dst, e.Text)
 		dst = append(dst, '}')
 
 	case "response.output_text.done":
 		dst = append(dst, `{"type":"response.output_text.done","item_id":`...)
 		dst = sse.AppendJSONString(dst, e.ItemID)
-		dst = append(dst, `,"output_index":0,"content_index":0,"text":`...)
+		dst = append(dst, `,"output_index":`...)
+		dst = sse.AppendInt(dst, int64(e.OutputIndex))
+		dst = append(dst, `,"content_index":0,"text":`...)
 		dst = sse.AppendJSONString(dst, e.Text)
 		dst = append(dst, '}')
 
 	case "response.content_part.done":
 		dst = append(dst, `{"type":"response.content_part.done","item_id":`...)
 		dst = sse.AppendJSONString(dst, e.ItemID)
-		dst = append(dst, `,"output_index":0,"content_index":0,"part":{"type":"output_text","text":`...)
+		dst = append(dst, `,"output_index":`...)
+		dst = sse.AppendInt(dst, int64(e.OutputIndex))
+		dst = append(dst, `,"content_index":0,"part":{"type":"output_text","text":`...)
 		dst = sse.AppendJSONString(dst, e.Text)
 		dst = append(dst, `,"annotations":[]}}`...)
 
 	case "response.output_item.done":
 		if e.ItemJSON != "" {
-			dst = append(dst, `{"type":"response.output_item.done","output_index":0,"item":`...)
+			dst = append(dst, `{"type":"response.output_item.done","output_index":`...)
+			dst = sse.AppendInt(dst, int64(e.OutputIndex))
+			dst = append(dst, `,"item":`...)
 			dst = append(dst, e.ItemJSON...)
 			dst = append(dst, '}')
 			break
 		}
-		dst = append(dst, `{"type":"response.output_item.done","output_index":0,"item":{"id":`...)
+		dst = append(dst, `{"type":"response.output_item.done","output_index":`...)
+		dst = sse.AppendInt(dst, int64(e.OutputIndex))
+		dst = append(dst, `,"item":{"id":`...)
 		dst = sse.AppendJSONString(dst, e.ItemID)
 		dst = append(dst, `,"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":`...)
 		dst = sse.AppendJSONString(dst, e.Text)

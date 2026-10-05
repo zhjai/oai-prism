@@ -22,7 +22,7 @@ func TestCORS_SupportedMutationsAndRoutingHeaders(t *testing.T) {
 	r.Header.Set("Origin", "https://console.example")
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, r)
-	for _, method := range []string{"PUT", "DELETE"} {
+	for _, method := range []string{"PUT", "PATCH", "DELETE"} {
 		if !strings.Contains(w.Header().Get("Access-Control-Allow-Methods"), method) {
 			t.Fatalf("missing method %s", method)
 		}

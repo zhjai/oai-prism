@@ -16,6 +16,7 @@ import {
   EditOutlined,
   DeleteOutlined,
   CopyOutlined,
+  CommentOutlined,
 } from '@ant-design/icons';
 import { Bubble, Sender, ThoughtChain, Prompts } from '@ant-design/x';
 import type { ReasoningEffort } from '../../../domain/chat/entity';
@@ -234,6 +235,40 @@ export const ChatPlaygroundPage: React.FC = () => {
               />
             </div>
           )}
+          {/* 上游 agent_message 进度：与推理、最终回答分区呈现 */}
+          {!isUser && m.progress && (
+            <section
+              role="region"
+              aria-label="上游进度"
+              aria-busy={streaming}
+              className="chat-progress"
+              style={{
+                marginBottom: 8,
+                padding: '6px 12px 8px',
+                borderInlineStart: `2px solid ${streaming ? token.colorPrimary : token.colorBorder}`,
+                borderRadius: '0 8px 8px 0',
+                background: token.colorFillQuaternary,
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: token.colorTextTertiary, marginBottom: 2 }}>
+                <CommentOutlined style={{ color: streaming ? token.colorPrimary : undefined }} />
+                <span>上游进度</span>
+              </div>
+              <div
+                style={{
+                  maxHeight: 160,
+                  overflowY: 'auto',
+                  whiteSpace: 'pre-wrap',
+                  overflowWrap: 'anywhere',
+                  fontSize: 13,
+                  lineHeight: 1.65,
+                  color: token.colorTextSecondary,
+                }}
+              >
+                {m.progress}
+              </div>
+            </section>
+          )}
           {isUser ? (
             <div style={{ whiteSpace: 'pre-wrap', fontSize: 14 }}>{m.content}</div>
           ) : (
@@ -245,7 +280,7 @@ export const ChatPlaygroundPage: React.FC = () => {
           )}
         </div>
       ),
-      loading: m.status === 'loading' && !m.content && !m.reasoning,
+      loading: m.status === 'loading' && !m.content && !m.reasoning && !m.progress,
     };
   });
 

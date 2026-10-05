@@ -74,6 +74,10 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 	}
 	sqliteStore, sqliteErr := account.NewSQLiteStore(dbPath, log)
 	if sqliteErr != nil {
+		if cfg.Creds.AutoRefresh {
+			pool.Close()
+			return nil, fmt.Errorf("初始化 SQLite 账号存储失败，无法安全保存自动刷新凭据: %w", sqliteErr)
+		}
 		// Error 级：SQLite 是 Dashboard 的持久化后端（账号/会话/请求日志），
 		// 失败意味着这些功能全部退化为内存态。降级可用，但必须显眼 ——
 		// 静默 Warn 曾让 CI 上的初始化失败被忽略（2026-10-03）。
@@ -913,6 +917,8 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 		}
 		_ = json.NewEncoder(w).Encode(item)
 	})
+
+	mux.HandleFunc("PATCH /admin/apikeys/{key}", s.renameAPIKey)
 
 	mux.HandleFunc("PUT /admin/apikeys/{key}/bindings", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {

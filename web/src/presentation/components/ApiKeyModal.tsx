@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useId, useState } from 'react';
 import {
   Modal,
   Table,
@@ -22,6 +22,7 @@ import {
   CopyOutlined,
   PlusOutlined,
   DeleteOutlined,
+  EditOutlined,
   CodeOutlined,
   ReloadOutlined,
   EyeOutlined,
@@ -51,6 +52,16 @@ function maskKey(k: string): string {
   if (!k) return '';
   if (k.length <= 12) return `${k.slice(0, 2)}••••${k.slice(-2)}`;
   return `${k.slice(0, 6)}••••••${k.slice(-4)}`;
+}
+
+/** 与后端一致：名称先 trim，按 Unicode 码点计长度，最多 64；空串表示移除名称。 */
+const KEY_NAME_MAX = 64;
+const countCodepoints = (s: string) => Array.from(s.trim()).length;
+
+function validateKeyName(raw: string): string {
+  if (/\p{Cc}/u.test(raw)) return '名称不能包含换行、制表符等控制字符';
+  if (countCodepoints(raw) > KEY_NAME_MAX) return `名称最多 ${KEY_NAME_MAX} 个字符`;
+  return '';
 }
 
 /**
@@ -83,6 +94,12 @@ const ApiKeyDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => {
   const [bindingIds, setBindingIds] = useState<string[]>([]);
   const [savingBindings, setSavingBindings] = useState(false);
   const [deletingKey, setDeletingKey] = useState<string | null>(null);
+  /** 正在重命名的密钥；草稿与服务端错误只活在这个小弹窗里，关闭即清空 */
+  const [renameTarget, setRenameTarget] = useState<ApiKeyItem | null>(null);
+  const [renameDraft, setRenameDraft] = useState('');
+  const [renameError, setRenameError] = useState('');
+  const [renaming, setRenaming] = useState(false);
+  const renameErrorId = useId();
   /** 代码示例是否嵌真实密钥（默认关闭：示例可能被复制或截图外传） */
   const [useRealKey, setUseRealKey] = useState(false);
   const accountOptions = accounts.map((a) => ({ value: a.id, label: `${a.name} (${a.id})${a.enabled ? '' : ' · 已停用'}` }));
@@ -225,6 +242,50 @@ const ApiKeyDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => {
     await fetchKeys();
   };
 
+  const openRename = (r: ApiKeyItem) => {
+    setRenameTarget(r);
+    setRenameDraft(r.name || '');
+    setRenameError('');
+  };
+
+  const closeRename = () => {
+    if (renaming) return;
+    setRenameTarget(null);
+    setRenameDraft('');
+    setRenameError('');
+  };
+
+  const renameValidation = validateKeyName(renameDraft);
+  const renameUnchanged = renameTarget !== null && renameDraft.trim() === (renameTarget.name || '');
+
+  /**
+   * 只改名称：成功后按服务端规范化后的名称就地更新该行，不重新拉列表 ——
+   * 刷新失败时也不会丢掉保留的清单，绑定、创建时间与当前密钥标记保持不变。
+   */
+  const handleRename = async () => {
+    if (!renameTarget || renaming || renameValidation || renameUnchanged) return;
+    const target = renameTarget.key;
+    const name = renameDraft.trim();
+    setRenaming(true);
+    setRenameError('');
+    try {
+      const res = await httpClient.patch<{ status: string; name?: string }>(
+        `/admin/apikeys/${encodeURIComponent(target)}`,
+        { name },
+      );
+      const saved = typeof res.data?.name === 'string' ? res.data.name : name;
+      setKeys((prev) => prev.map((item) => (item.key === target ? { ...item, name: saved } : item)));
+      setRenameTarget(null);
+      setRenameDraft('');
+      message.success(saved ? '名称已保存' : '已移除密钥名称');
+    } catch (err: any) {
+      // 留在弹窗里显示原因，草稿不丢，改正后可直接重试
+      setRenameError(`保存失败：${err?.message || '请稍后重试'}`);
+    } finally {
+      setRenaming(false);
+    }
+  };
+
   /**
    * 唯一的剪贴板写入口：await 结果，成功/失败各给一次提示。
    * 失败时不重试同一个不可用的 API，也不虚报成功。
@@ -262,7 +323,30 @@ const ApiKeyDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => {
       title: '密钥名称',
       dataIndex: 'name',
       key: 'name',
-      render: (name: string) => <Text strong>{name}</Text>,
+      width: 220,
+      // 定宽 + 省略：64 个码点的长名称不会撑开表格或挤压操作列，完整名称放在悬浮提示里
+      render: (name: string, r: ApiKeyItem) => (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 2, minWidth: 0 }}>
+          {name ? (
+            <Text strong ellipsis={{ tooltip: name }} style={{ minWidth: 0, maxWidth: 172, flex: '0 1 auto' }}>
+              {name}
+            </Text>
+          ) : (
+            <Text type="secondary" italic style={{ flex: '0 1 auto' }}>未命名</Text>
+          )}
+          <Tooltip title="编辑名称">
+            <Button
+              type="text"
+              size="small"
+              aria-label={name ? `编辑名称：${name}` : '编辑名称'}
+              icon={<EditOutlined />}
+              onClick={() => openRename(r)}
+              disabled={renaming}
+              style={{ flex: 'none', color: token.colorTextTertiary }}
+            />
+          </Tooltip>
+        </div>
+      ),
     },
     {
       title: 'API Key (Bearer Token)',
@@ -432,9 +516,11 @@ experimental_bearer_token = "${firstKey}"`;
         </Space>
       }
       open
-      onCancel={onClose}
+      onCancel={() => { if (!renaming) onClose(); }}
+      closable={!renaming}
+      keyboard={!renaming}
       footer={[
-        <Button key="close" type="primary" onClick={onClose}>
+        <Button key="close" type="primary" onClick={onClose} disabled={renaming}>
           完成
         </Button>,
       ]}
@@ -526,7 +612,7 @@ experimental_bearer_token = "${firstKey}"`;
                   loading={loading}
                   pagination={false}
                   size="small"
-                  scroll={{ x: 780 }}
+                  scroll={{ x: 860 }}
                   locale={{
                     emptyText: loading ? (
                       <span style={{ display: 'inline-block', padding: '16px 0' }}>正在读取密钥列表…</span>
@@ -573,7 +659,7 @@ experimental_bearer_token = "${firstKey}"`;
       />
     </Modal>
     <Modal
-      title={editingKey ? `绑定账号 · ${editingKey.name}` : '绑定账号'}
+      title={editingKey ? `绑定账号 · ${editingKey.name || '未命名'}` : '绑定账号'}
       open={Boolean(editingKey)}
       onCancel={() => { if (!savingBindings) setEditingKey(null); }}
       onOk={handleSaveBindings}
@@ -605,6 +691,42 @@ experimental_bearer_token = "${firstKey}"`;
           暂时读不到账号列表，无法在此选择绑定账号；可稍后重试。
         </Text>
       )}
+    </Modal>
+    {/* 只编辑名称：不展示密钥本身（含掩码），绑定与创建时间也不在这里出现 */}
+    <Modal
+      title="编辑密钥名称"
+      open={Boolean(renameTarget)}
+      onCancel={closeRename}
+      onOk={() => void handleRename()}
+      confirmLoading={renaming}
+      okText="保存名称"
+      cancelText="取消"
+      okButtonProps={{ disabled: Boolean(renameValidation) || renameUnchanged }}
+      closable={!renaming}
+      keyboard={!renaming}
+      cancelButtonProps={{ disabled: renaming }}
+      width={440}
+      destroyOnHidden
+    >
+      <Input
+        autoFocus
+        aria-label="密钥名称"
+        aria-invalid={Boolean(renameValidation || renameError)}
+        aria-describedby={renameErrorId}
+        placeholder="例如：生产环境客户端"
+        value={renameDraft}
+        onChange={(e) => { setRenameDraft(e.target.value); setRenameError(''); }}
+        onPressEnter={() => void handleRename()}
+        status={renameValidation || renameError ? 'error' : undefined}
+        count={{ show: true, max: KEY_NAME_MAX, strategy: countCodepoints }}
+        disabled={renaming}
+        allowClear={!renaming}
+      />
+      <div id={renameErrorId} aria-live="polite" style={{ marginTop: 8, minHeight: 20, fontSize: 12 }}>
+        {(renameValidation || renameError) && (
+          <Text type="danger" style={{ fontSize: 12 }}>{renameValidation || renameError}</Text>
+        )}
+      </div>
     </Modal>
     </>
   );

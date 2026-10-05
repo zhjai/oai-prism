@@ -38,6 +38,8 @@ type Pool struct {
 	buildMu           sync.Mutex
 	persistCredential func(string, *creds.Credential, *creds.Credential) (bool, error)
 	proxyClients      map[string]*httpc.Client
+	refreshWake       chan struct{}
+	refreshRunning    atomic.Bool
 
 	rr atomic.Uint64
 }
@@ -50,12 +52,13 @@ func NewPool(cfg *config.Config, log *slog.Logger) (*Pool, error) {
 	}
 
 	p := &Pool{
-		cfg:    cfg.Pool,
-		creds:  cfg.Creds,
-		up:     cfg.Upstream,
-		log:    log,
-		client: baseClient,
-		sticky: newStickyMap(64, cfg.Pool.StickyTTL),
+		cfg:         cfg.Pool,
+		creds:       cfg.Creds,
+		up:          cfg.Upstream,
+		log:         log,
+		client:      baseClient,
+		sticky:      newStickyMap(64, cfg.Pool.StickyTTL),
+		refreshWake: make(chan struct{}, 1),
 	}
 	if err := p.Build(cfg.Creds.Accounts); err != nil {
 		baseClient.CloseIdle()
@@ -186,6 +189,7 @@ func (p *Pool) buildLocked(cfgs []config.AccountConfig) (err error) {
 	}
 
 	p.accounts.Store(&built)
+	p.signalRefresh()
 	for proxy, client := range p.proxyClients {
 		if clients[proxy] != client {
 			client.CloseIdle()
@@ -549,6 +553,9 @@ func (p *Pool) MarkResult(a *Account, err error, retryAfter time.Duration) {
 	case creds.IsAuthError(err):
 		a.MarkAuthFailed()
 		d := a.MarkFailure(now, p.cfg.Cooldown, p.cfg.CooldownBackoff, p.cfg.MaxCooldown)
+		if c := a.Credential(); c != nil && c.CanRefresh() {
+			p.signalRefresh()
+		}
 		p.log.Warn("账号认证失效，进入冷却", "account", a.ID, "cooldown", d.Round(time.Second), "err", err)
 	case creds.IsRateLimited(err):
 		d := retryAfter
@@ -574,6 +581,7 @@ func (p *Pool) StartBackground(ctx context.Context) {
 		if interval <= 0 {
 			interval = 10 * time.Minute
 		}
+		p.refreshRunning.Store(true)
 		go p.refreshLoop(ctx, interval)
 	}
 	if p.cfg.HealthCheck {
@@ -586,23 +594,54 @@ func (p *Pool) StartBackground(ctx context.Context) {
 	go p.sticky.janitor(ctx)
 }
 
+func (p *Pool) signalRefresh() {
+	if !p.refreshRunning.Load() || p.refreshWake == nil {
+		return
+	}
+	select {
+	case p.refreshWake <- struct{}{}:
+	default:
+	}
+}
+
+const (
+	refreshAccountTimeout = 30 * time.Second
+	refreshMinDelay       = 100 * time.Millisecond
+	refreshMaxConcurrency = 4
+)
+
 func (p *Pool) refreshLoop(ctx context.Context, interval time.Duration) {
 	r, err := creds.NewRefresher(p.creds, p.up, p.client)
 	if err != nil {
+		p.refreshRunning.Store(false)
 		p.log.Error("初始化刷新器失败", "err", err)
 		return
 	}
-
-	t := time.NewTicker(interval)
-	defer t.Stop()
+	defer p.refreshRunning.Store(false)
 
 	// 启动时先跑一轮，处理"进程重启后凭据已过期"的情况。
 	p.refreshAll(ctx, r)
 
 	for {
+		delay := p.nextRefreshDelay(time.Now(), interval)
+		t := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
+			if !t.Stop() {
+				select {
+				case <-t.C:
+				default:
+				}
+			}
 			return
+		case <-p.refreshWake:
+			if !t.Stop() {
+				select {
+				case <-t.C:
+				default:
+				}
+			}
+			continue
 		case <-t.C:
 			p.refreshAll(ctx, r)
 		}
@@ -610,12 +649,20 @@ func (p *Pool) refreshLoop(ctx context.Context, interval time.Duration) {
 }
 
 func (p *Pool) refreshAll(ctx context.Context, r *creds.Refresher) {
+	interval := p.creds.RefreshInterval
+	if interval <= 0 {
+		interval = 10 * time.Minute
+	}
 	skew := p.creds.RefreshSkew
 	if skew <= 0 {
 		skew = 5 * time.Minute
 	}
 	now := time.Now()
-
+	type target struct {
+		a *Account
+		c *creds.Credential
+	}
+	targets := make([]target, 0)
 	for _, a := range p.Accounts() {
 		if !a.enabled.Load() {
 			continue
@@ -633,10 +680,99 @@ func (p *Pool) refreshAll(ctx context.Context, r *creds.Refresher) {
 			p.log.Debug("账号无法自愈，跳过刷新", "account", a.ID, "source", c.Source)
 			continue
 		}
-		if _, err := p.RefreshAccount(ctx, r, a); err != nil {
-			p.log.Warn("账号刷新失败", "account", a.ID, "err", err)
+		if a.refreshBlocked(c, now) {
+			continue
+		}
+		targets = append(targets, target{a: a, c: c})
+	}
+	if len(targets) == 0 {
+		return
+	}
+	workers := len(targets)
+	if workers > refreshMaxConcurrency {
+		workers = refreshMaxConcurrency
+	}
+	jobs := make(chan target)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case item, ok := <-jobs:
+					if !ok {
+						return
+					}
+					accountCtx, cancel := context.WithTimeout(ctx, refreshAccountTimeout)
+					next, err := p.RefreshAccount(accountCtx, r, item.a)
+					cancel()
+					if err != nil {
+						if ctx.Err() == nil {
+							item.a.noteRefreshFailure(item.c, time.Now(), interval)
+							p.log.Warn("账号刷新失败", "account", item.a.ID, "err", err)
+						}
+						continue
+					}
+					item.a.noteRefreshSuccess(next, time.Now(), interval, skew)
+				}
+			}
+		}()
+	}
+	for _, item := range targets {
+		select {
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			return
+		case jobs <- item:
 		}
 	}
+	close(jobs)
+	wg.Wait()
+}
+
+func (p *Pool) nextRefreshDelay(now time.Time, interval time.Duration) time.Duration {
+	if interval <= 0 {
+		interval = 10 * time.Minute
+	}
+	next := now.Add(interval)
+	skew := p.creds.RefreshSkew
+	if skew <= 0 {
+		skew = 5 * time.Minute
+	}
+	for _, a := range p.Accounts() {
+		if !a.enabled.Load() {
+			continue
+		}
+		c := a.Credential()
+		if c == nil || !c.CanRefresh() {
+			continue
+		}
+		wake := now.Add(interval)
+		if !c.ExpiresAt.IsZero() {
+			wake = c.ExpiresAt.Add(-skew)
+		}
+		if !c.Usable() || a.AuthFailed() {
+			wake = now
+		}
+		if retryAt, ok := a.refreshRetryAt(c); ok && retryAt.After(wake) {
+			wake = retryAt
+		}
+		if successAt, ok := a.refreshSuccessAt(c); ok && successAt.After(wake) {
+			wake = successAt
+		}
+		if wake.Before(next) {
+			next = wake
+		}
+	}
+	delay := next.Sub(now)
+	if next.Before(now) || delay < refreshMinDelay {
+		return refreshMinDelay
+	}
+	return delay
 }
 
 // RefreshAccount 刷新单个账号，并保证同一账号同一时刻只有一次刷新在飞。
@@ -680,7 +816,7 @@ func (p *Pool) RefreshAccount(ctx context.Context, r *creds.Refresher, a *Accoun
 	p.buildMu.Lock()
 	defer p.buildMu.Unlock()
 	current := p.Get(a.ID)
-	if current == nil || current.accountRuntime != a.accountRuntime || a.Credential() != cur {
+	if current == nil || current.accountRuntime != a.accountRuntime || credentialMaterialChanged(cur, a.Credential()) {
 		call.err = fmt.Errorf("账号已删除或凭据已更新，请重试")
 		return nil, call.err
 	}
@@ -695,18 +831,20 @@ func (p *Pool) RefreshAccount(ctx context.Context, r *creds.Refresher, a *Accoun
 			return nil, call.err
 		}
 	}
-	if !a.cred.CompareAndSwap(cur, next) {
+	latest := a.Credential()
+	merged := mergeRefreshCredential(latest, cur, next)
+	if !a.cred.CompareAndSwap(latest, merged) {
 		call.err = fmt.Errorf("账号凭据已更新，请重试")
 		return nil, call.err
 	}
 	a.MarkSuccess()
-	call.credential = next
+	call.credential = merged
 	p.log.Info("账号凭据已刷新",
 		"account", a.ID,
 		"source", next.Source,
 		"expires_at", next.ExpiresAt.UTC().Format(time.RFC3339),
 		"plan", next.Plan)
-	return next, nil
+	return merged, nil
 }
 
 func (p *Pool) SetCredentialPersister(fn func(string, *creds.Credential, *creds.Credential) (bool, error)) {
@@ -752,7 +890,12 @@ func (p *Pool) healthLoop(ctx context.Context, interval time.Duration) {
 					_, err := p.probe(cctx, a, path)
 					if err != nil {
 						p.log.Debug("健康检查失败", "account", a.ID, "err", err)
-						p.MarkResult(a, &creds.APIError{Op: "health", Status: 401, Body: err.Error()}, 0)
+						var retryAfter time.Duration
+						var apiErr *creds.APIError
+						if errors.As(err, &apiErr) {
+							retryAfter = apiErr.RetryAfter
+						}
+						p.MarkResult(a, err, retryAfter)
 						return
 					}
 					a.MarkSuccess()
@@ -798,7 +941,7 @@ func (p *Pool) probe(ctx context.Context, a *Account, path string) (int, error) 
 	}
 	defer drainClose(resp)
 	if resp.StatusCode != 200 {
-		return resp.StatusCode, fmt.Errorf("HTTP %d", resp.StatusCode)
+		return resp.StatusCode, &creds.APIError{Op: "health", Status: resp.StatusCode, Body: fmt.Sprintf("HTTP %d", resp.StatusCode)}
 	}
 	return 200, nil
 }

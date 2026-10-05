@@ -35,6 +35,7 @@ export interface ChatMessage {
   content: string;
   attachments?: ChatAttachment[]; // 仅 user 消息：随消息持久化的图片附件
   reasoning?: string;         // 模型思考过程（ThoughtChain 呈现）
+  progress?: string;          // 上游 agent_message 进度（仅展示与持久化，不回传为模型输入）
   status?: 'loading' | 'success' | 'error';
   createdAt: string;
 }
@@ -62,7 +63,7 @@ export interface SendMessageOptions {
   /** 本会话此前的对话历史（不含本轮 user 消息与 assistant 占位）。
    * 上游不代管对话历史，每次请求必须回传完整 messages 才有上下文。 */
   history?: ChatMessage[];
-  onChunk?: (chunk: string, reasoningChunk?: string) => void;
+  onChunk?: (chunk: string, reasoningChunk?: string, progressChunk?: string) => void;
   onUsage?: (usage: ChatUsage) => void;
   onError?: (err: Error) => void;
   onFinish?: () => void;

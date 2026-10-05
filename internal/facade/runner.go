@@ -2,6 +2,7 @@ package facade
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -107,7 +108,65 @@ func (req *RunRequest) dropContinuation() {
 type Delta struct {
 	Text      string
 	Reasoning string
+	Progress  []prism.LiveProgressEvent
 	Reset     bool
+}
+
+const progressDedupWindow = 256
+
+type progressDeduper struct {
+	seen map[progressKey]progressFingerprint
+	high map[string]int
+}
+
+type progressKey struct {
+	typ   string
+	index int
+}
+
+type progressFingerprint struct {
+	length int
+	hash   [32]byte
+}
+
+func newProgressDeduper() *progressDeduper {
+	return &progressDeduper{seen: make(map[progressKey]progressFingerprint), high: make(map[string]int)}
+}
+
+func (d *progressDeduper) fresh(events []prism.LiveProgressEvent) []prism.LiveProgressEvent {
+	if d == nil || len(events) == 0 {
+		return nil
+	}
+	out := make([]prism.LiveProgressEvent, 0, len(events))
+	for _, ev := range events {
+		if ev.LineIndex < 0 || ev.Text == "" || (ev.Type != "agent_message" && ev.Type != "agent_reasoning") {
+			continue
+		}
+		if ev.LineIndex > d.high[ev.Type] {
+			d.high[ev.Type] = ev.LineIndex
+			for key := range d.seen {
+				if key.typ == ev.Type && key.index <= ev.LineIndex-progressDedupWindow {
+					delete(d.seen, key)
+				}
+			}
+		}
+		// Old snapshots may still contain evicted entries. The high watermark
+		// prevents those entries from being emitted again.
+		if ev.LineIndex <= d.high[ev.Type]-progressDedupWindow {
+			continue
+		}
+		key := progressKey{typ: ev.Type, index: ev.LineIndex}
+		full := ev.Text
+		if prior, ok := d.seen[key]; ok {
+			if len(full) <= prior.length || sha256.Sum256([]byte(full[:prior.length])) != prior.hash {
+				continue
+			}
+			ev.Text = full[prior.length:]
+		}
+		d.seen[key] = progressFingerprint{length: len(full), hash: sha256.Sum256([]byte(full))}
+		out = append(out, ev)
+	}
+	return out
 }
 
 // RunResult 是一次运行的最终结果。
@@ -259,6 +318,16 @@ func (r *Runner) Run(ctx context.Context, req *RunRequest, emit func(Delta) erro
 		lastRes *RunResult
 		emitted bool
 	)
+	if emit != nil {
+		write := emit
+		emit = func(d Delta) error {
+			// A callback can partially write before returning an error.
+			if d.Text != "" || d.Reasoning != "" || len(d.Progress) > 0 {
+				emitted = true
+			}
+			return write(d)
+		}
+	}
 
 	for attempt := 0; attempt < r.accountRetries; attempt++ {
 		lease, err := r.acquire(ctx, req)
@@ -283,7 +352,7 @@ func (r *Runner) Run(ctx context.Context, req *RunRequest, emit func(Delta) erro
 				// 还没吐出内容就用新会话 + 全量上下文原地重来一次。
 				gone := nt.plan != nil && nt.plan.continued && isConversationGone(err)
 				nt.release(gone, r)
-				if gone && (res == nil || res.Text == "") && ctx.Err() == nil && attempt+1 < r.accountRetries {
+				if gone && !emitted && (res == nil || res.Text == "") && ctx.Err() == nil && attempt+1 < r.accountRetries {
 					r.log.Warn("原生续接：上游会话不可用，改用新会话全量重试", "key", nt.key, "err", err)
 					lastErr, lastRes = err, res
 					continue
@@ -615,12 +684,63 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 	r.app.ConversationOps.Inc("start", "ok")
 
 	var (
-		prev      string
-		firstAt   time.Time
-		requestID = startResp.RequestID
-		convID    = startResp.ConversationID
-		turnState = startResp.TurnState
+		prev          string
+		prevReasoning string
+		firstAt       time.Time
+		requestID     = startResp.RequestID
+		convID        = startResp.ConversationID
+		turnState     = startResp.TurnState
 	)
+	progressSeen := newProgressDeduper()
+	firstProgress := false
+	metricAPI := req.API
+	switch metricAPI {
+	case "chat", "responses", "messages":
+	default:
+		metricAPI = "other"
+	}
+	observeProgress := func(hasProgress bool) {
+		if hasProgress && !firstProgress {
+			firstProgress = true
+			r.app.FacadeFirstProgress.Observe(time.Since(started).Seconds(), metricAPI)
+		}
+	}
+	reasoningSource := ""
+	streamProgress := func(st *prism.StatusResponse) (string, []prism.LiveProgressEvent) {
+		progress := progressSeen.fresh(st.Progress)
+		reasoning := st.Reasoning
+		if reasoning == "" {
+			reasoning = st.ReasoningDelta
+		}
+		if reasoningSource == "" {
+			for _, ev := range progress {
+				if ev.Type == "agent_reasoning" {
+					reasoningSource = "live"
+					break
+				}
+			}
+			if reasoningSource == "" && reasoning != "" {
+				reasoningSource = "output"
+			}
+		}
+		if reasoningSource != "output" {
+			return "", progress
+		}
+		filtered := progress[:0]
+		for _, ev := range progress {
+			if ev.Type != "agent_reasoning" {
+				filtered = append(filtered, ev)
+			}
+		}
+		// Select one reasoning source per turn and only append extensions;
+		// rewritten summaries cannot replace bytes already sent to a client.
+		if !strings.HasPrefix(reasoning, prevReasoning) {
+			return "", filtered
+		}
+		delta := reasoning[len(prevReasoning):]
+		prevReasoning = reasoning
+		return delta, filtered
+	}
 
 	result.RequestID = requestID
 	result.ConversationID = convID
@@ -647,6 +767,7 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		firstAt = time.Now()
 		result.FirstDelta = firstAt.Sub(started)
 		r.app.FacadeFirstByte.Observe(result.FirstDelta.Seconds(), req.API)
+		r.app.FacadeFirstOutput.Observe(result.FirstDelta.Seconds(), metricAPI)
 	}
 
 	// 3) start 有可能直接就是终态（回答很短，或者立刻失败了）。
@@ -661,19 +782,30 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		if st.Text != "" {
 			prev = st.Text
 			result.Text = st.Text
-			if st.Delta != "" && emit != nil {
-				if eerr := emit(Delta{Text: st.Delta, Reasoning: st.ReasoningDelta, Reset: st.Reset}); eerr != nil {
-					return result, eerr
-				}
-				bumpFirstByte()
-				r.app.SSEDeltas.Inc(req.API)
-			}
 		}
 		if st.Usage != nil {
 			result.Usage = st.Usage
 		}
 		if st.Reasoning != "" {
 			result.Reasoning = st.Reasoning
+		}
+		reasoningDelta, progress := streamProgress(st)
+		observeProgress(reasoningDelta != "" || len(progress) > 0)
+		if st.Delta != "" || reasoningDelta != "" || len(progress) > 0 {
+			if emit != nil {
+				if eerr := emit(Delta{Text: st.Delta, Reasoning: reasoningDelta, Progress: progress, Reset: st.Reset}); eerr != nil {
+					if !st.Done {
+						r.stopUpstream(p, requestID, convID, turnState)
+					}
+					return result, eerr
+				}
+			}
+			if st.Delta != "" {
+				bumpFirstByte()
+			}
+			if emit != nil {
+				r.app.SSEDeltas.Inc(req.API)
+			}
 		}
 		if st.ResponseID != "" {
 			result.ResponseID = st.ResponseID
@@ -814,20 +946,29 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 			result.ListenSnapshot = st.ListenSnapshot
 		}
 
-		if st.Delta != "" {
+		reasoningDelta, progress := streamProgress(st)
+		hasProgress := reasoningDelta != "" || len(progress) > 0
+		observeProgress(hasProgress)
+		if st.Delta != "" || hasProgress {
 			if emit != nil {
-				if eerr := emit(Delta{Text: st.Delta, Reasoning: st.ReasoningDelta, Reset: st.Reset}); eerr != nil {
-					r.stopUpstream(p, requestID, convID, turnState)
+				if eerr := emit(Delta{Text: st.Delta, Reasoning: reasoningDelta, Progress: progress, Reset: st.Reset}); eerr != nil {
+					if !st.Done {
+						r.stopUpstream(p, requestID, convID, turnState)
+					}
 					return result, eerr
 				}
+			}
+			if st.Delta != "" {
 				bumpFirstByte()
+				result.Text = st.Text
+				if result.Text == "" {
+					result.Text = prev + st.Delta
+				}
+				prev = result.Text
+			}
+			if emit != nil {
 				r.app.SSEDeltas.Inc(req.API)
 			}
-			result.Text = st.Text
-			if result.Text == "" {
-				result.Text = prev + st.Delta
-			}
-			prev = result.Text
 			// 有进展就把退避重置回基线。
 			interval = f.PollInterval
 		} else {
@@ -837,6 +978,28 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 			}
 			r.app.PollEmpty.Inc("status")
 			interval = nextInterval(interval, f.PollBackoffMax)
+		}
+
+		// A terminal response is already complete; return before applying the
+		// pacing interval used only between nonterminal polls.
+		if st.Done {
+			if result.Text == "" {
+				result.Text = prev
+			}
+			r.app.PollRounds.Inc("done")
+			if st.Fail {
+				err := r.upstreamFailure(st, inputItems, inputTokens)
+				r.journal.MarkTerminal(requestID, "failed", "", err)
+				return result, err
+			}
+			r.journal.MarkTerminal(requestID, "completed", result.Text, nil)
+			if result.Usage == nil {
+				result.Usage = measuredUsage(inputTokens(), result)
+			}
+			if result.ProjectID != "" && result.ConversationID != "" {
+				r.projects.Put(acct.ID, "cid:"+result.ConversationID, result.ProjectID, time.Now())
+			}
+			return result, nil
 		}
 
 		// 统一的轮询节流。
@@ -856,28 +1019,6 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 			}
 		}
 
-		if st.Done {
-			if result.Text == "" {
-				result.Text = prev
-			}
-			r.app.PollRounds.Inc("done")
-			// 关键：失败也算 Done。上游用 HTTP 200 + response.status=error
-			// 表达失败，漏判就会返回一个"成功的空回答"。
-			if st.Fail {
-				err := r.upstreamFailure(st, inputItems, inputTokens)
-				r.journal.MarkTerminal(requestID, "failed", "", err)
-				return result, err
-			}
-			r.journal.MarkTerminal(requestID, "completed", result.Text, nil)
-			// 用量计算与上方 start 直达完成路径同款。
-			if result.Usage == nil {
-				result.Usage = measuredUsage(inputTokens(), result)
-			}
-			if result.ProjectID != "" && result.ConversationID != "" {
-				r.projects.Put(acct.ID, "cid:"+result.ConversationID, result.ProjectID, time.Now())
-			}
-			return result, nil
-		}
 	}
 }
 

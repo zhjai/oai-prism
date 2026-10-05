@@ -122,7 +122,7 @@ func (c *Credential) NeedsRefresh(now time.Time, skew time.Duration) bool {
 	if c == nil || c.ExpiresAt.IsZero() {
 		return false
 	}
-	return now.Add(skew).After(c.ExpiresAt)
+	return !now.Add(skew).Before(c.ExpiresAt)
 }
 
 // CanRefresh 判断是否具备自愈能力。

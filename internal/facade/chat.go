@@ -154,6 +154,18 @@ func (h *Handler) streamChat(w http.ResponseWriter, r *http.Request, runReq *Run
 	}
 
 	emit := func(d Delta) error {
+		for _, progress := range d.Progress {
+			spec := ChatChunkSpec{ID: id, Created: created, Model: publicModel}
+			if progress.Type == "agent_reasoning" {
+				spec.Reasoning = progress.Text
+			} else {
+				spec.Progress = progress.Text
+			}
+			buf = AppendChatChunk(buf[:0], spec)
+			if err := sw.WriteData(buf); err != nil {
+				return err
+			}
+		}
 		// 思维链与正文分成两个 chunk：混在一起会让客户端
 		// 把推理过程当正文渲染出来。
 		if d.Reasoning != "" {

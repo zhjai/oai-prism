@@ -333,6 +333,9 @@ type StatusResponse struct {
 	Reset          bool
 	Reasoning      string
 	ReasoningDelta string
+	// Progress contains validated entries from codex_live_progress. These are
+	// transient narration and are deliberately kept separate from Text/output.
+	Progress []LiveProgressEvent
 
 	// OutputItems 是上游返回的确定性 Response 条目列表（支持 message, function_call, reasoning 等）。
 	OutputItems []CodexOutputItem
@@ -417,11 +420,21 @@ type PrismEnvelope struct {
 	// ListenSnapshot 是沙箱内 codex 会话的状态指针（codex_session_id /
 	// transcript_cursor 等）。下一轮 start 必须原样回传 —— 多轮续接的
 	// 另一半钥匙（另一半是 previousResponseId）。真实 Web 每轮都带。
-	ListenSnapshot json.RawMessage `json:"codex_listen_snapshot,omitempty"`
-	Response       *struct {
+	ListenSnapshot    json.RawMessage `json:"codex_listen_snapshot,omitempty"`
+	CodexLiveProgress json.RawMessage `json:"codex_live_progress,omitempty"`
+	Response          *struct {
 		Status  string        `json:"status"` // "success", "error"
 		Payload *CodexPayload `json:"payload"`
 	} `json:"response,omitempty"`
+}
+
+// LiveProgressEvent is a validated, transient progress update from Prism.
+// Type is agent_reasoning or agent_message; LineIndex is the stable upstream
+// identity used for request-local deduplication.
+type LiveProgressEvent struct {
+	Type      string
+	LineIndex int
+	Text      string
 }
 
 // Usage 是 token 用量。

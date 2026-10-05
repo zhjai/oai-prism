@@ -20,11 +20,13 @@ type App struct {
 	UpstreamRetries  *CounterVec // path
 
 	// 门面业务。
-	FacadeRuns      *CounterVec // api, model, status
-	FacadeLatency   *HistogramVec
-	FacadeFirstByte *HistogramVec // 首字延迟——流式体验的核心指标
-	SSEDeltas       *CounterVec   // api
-	Tokens          *CounterVec   // api, direction
+	FacadeRuns          *CounterVec // api, model, status
+	FacadeLatency       *HistogramVec
+	FacadeFirstByte     *HistogramVec // 首字延迟——流式体验的核心指标
+	FacadeFirstProgress *HistogramVec // api; transient reasoning or narration
+	FacadeFirstOutput   *HistogramVec // api; answer text, excluding progress
+	SSEDeltas           *CounterVec   // api
+	Tokens              *CounterVec   // api, direction
 
 	// 上游协议轮询。
 	PollRounds      *CounterVec // result
@@ -58,11 +60,13 @@ func NewApp() *App {
 		UpstreamDuration: r.Histogram("oaiprism_upstream_request_duration_seconds", "上游请求耗时", DefaultBuckets, "path"),
 		UpstreamRetries:  r.Counter("oaiprism_upstream_retries_total", "上游重试次数", "path"),
 
-		FacadeRuns:      r.Counter("oaiprism_facade_runs_total", "兼容门面调用数", "api", "model", "status"),
-		FacadeLatency:   r.Histogram("oaiprism_facade_latency_seconds", "兼容门面端到端耗时", DefaultBuckets, "api"),
-		FacadeFirstByte: r.Histogram("oaiprism_facade_first_delta_seconds", "首字延迟", []float64{0.1, 0.25, 0.5, 1, 2, 3, 5, 8, 15, 30, 60}, "api"),
-		SSEDeltas:       r.Counter("oaiprism_sse_deltas_total", "SSE 增量事件数", "api"),
-		Tokens:          r.Counter("oaiprism_tokens_total", "token 用量", "api", "direction"),
+		FacadeRuns:          r.Counter("oaiprism_facade_runs_total", "兼容门面调用数", "api", "model", "status"),
+		FacadeLatency:       r.Histogram("oaiprism_facade_latency_seconds", "兼容门面端到端耗时", DefaultBuckets, "api"),
+		FacadeFirstByte:     r.Histogram("oaiprism_facade_first_delta_seconds", "首字延迟", []float64{0.1, 0.25, 0.5, 1, 2, 3, 5, 8, 15, 30, 60}, "api"),
+		FacadeFirstProgress: r.Histogram("oaiprism_facade_first_progress_seconds", "Time to first reasoning or narration", DefaultBuckets, "api"),
+		FacadeFirstOutput:   r.Histogram("oaiprism_facade_first_output_seconds", "Time to first answer output", DefaultBuckets, "api"),
+		SSEDeltas:           r.Counter("oaiprism_sse_deltas_total", "SSE 增量事件数", "api"),
+		Tokens:              r.Counter("oaiprism_tokens_total", "token 用量", "api", "direction"),
 
 		PollRounds:      r.Counter("oaiprism_poll_rounds_total", "轮询轮次", "result"),
 		PollEmpty:       r.Counter("oaiprism_poll_empty_total", "空轮询次数（无新内容的轮次）", "kind"),

@@ -555,8 +555,23 @@ func (c *Client) StartResponse(ctx context.Context, p Principal, req *StartReque
 
 	// 保底：宽容抽取。
 	if v != nil {
+		progress := parseLiveProgress(v)
+		if root, ok := v.(map[string]any); ok {
+			clean := make(map[string]any, len(root))
+			for key, value := range root {
+				if key != "codex_live_progress" {
+					clean[key] = value
+				}
+			}
+			v = clean
+		}
 		out.RequestID = FindString(v, c.schema.RespIDKeys)
 		out.Status = FindString(v, c.schema.RespStatusKeys)
+		if len(progress) > 0 {
+			// Generic start bodies can echo prompts and unrelated done/error
+			// fields. Only previews are safe to attach as an initial status.
+			out.Initial = &StatusResponse{Raw: raw, RequestID: out.RequestID, Progress: progress}
+		}
 	}
 	if out.RequestID == "" && !strings.HasPrefix(strings.TrimSpace(string(raw)), "{") {
 		// 有些实现直接把 id 当纯文本回。
@@ -803,6 +818,7 @@ func (c *Client) parseEnvelope(v any, raw []byte, fallbackID, prevText string) (
 			Status:         strings.ToLower(strings.TrimSpace(env.Status)),
 			Usage:          env.Usage,
 		}
+		out.Progress = parseLiveProgress(v)
 		if env.Message != "" && out.Status == "error" {
 			out.Fail = true
 			out.Done = true
@@ -909,6 +925,7 @@ func (c *Client) parseEnvelope(v any, raw []byte, fallbackID, prevText string) (
 	}
 
 	out := &StatusResponse{Raw: raw, RequestID: rid}
+	out.Progress = parseLiveProgress(v)
 	if fallbackID != "" {
 		// 以服务端回的为准，但带上兜底便于排障。
 		out.RequestID = rid
@@ -1126,6 +1143,18 @@ func textFromBlocks(v any) string {
 // 至少能"凑合活着"，而不是全线 500。
 func (c *Client) parseGeneric(v any, raw []byte, fallbackID, prevText string) (*StatusResponse, error) {
 	out := &StatusResponse{Raw: raw, RequestID: fallbackID}
+	out.Progress = parseLiveProgress(v)
+	// Recursive fallback extraction must never mistake narration for an answer,
+	// an error, or a status field.
+	if root, ok := v.(map[string]any); ok {
+		clean := make(map[string]any, len(root))
+		for key, value := range root {
+			if key != "codex_live_progress" {
+				clean[key] = value
+			}
+		}
+		v = clean
+	}
 	s := c.schema
 
 	if id := FindString(v, s.RespIDKeys); id != "" {
@@ -1197,6 +1226,110 @@ func (c *Client) parseGeneric(v any, raw []byte, fallbackID, prevText string) (*
 		out.Done = true
 	}
 	return out, nil
+}
+
+// parseLiveProgress extracts only the documented codex_live_progress forms.
+// It intentionally validates an entry before returning it: callers can then
+// mark returned identities as seen without losing a later corrected entry.
+func parseLiveProgress(v any) []LiveProgressEvent {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil
+	}
+	raw, ok := m["codex_live_progress"]
+	if !ok || raw == nil {
+		return nil
+	}
+	progress, ok := raw.(map[string]any)
+	if !ok {
+		return nil
+	}
+	out := make([]LiveProgressEvent, 0)
+	if entries, ok := progress["eventPreviews"].([]any); ok {
+		for _, item := range entries {
+			e, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			idx, ok := progressLineIndex(e["line_index"])
+			if !ok {
+				continue
+			}
+			typ, _ := e["payload_type"].(string)
+			if typ != "agent_reasoning" && typ != "agent_message" {
+				continue
+			}
+			text := progressPayloadText(e["raw"], typ)
+			if text == "" {
+				text = progressPayloadText(e["payload"], typ)
+			}
+			if text == "" {
+				// Some captures put the payload fields directly on the entry.
+				if typ == "agent_reasoning" {
+					text, _ = e["text"].(string)
+				} else {
+					text, _ = e["message"].(string)
+				}
+			}
+			if text != "" {
+				out = append(out, LiveProgressEvent{Type: typ, LineIndex: idx, Text: text})
+			}
+		}
+	}
+	if entries, ok := progress["reasoningSummaries"].([]any); ok {
+		for _, item := range entries {
+			e, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			idx, ok := progressLineIndex(e["line_index"])
+			if !ok {
+				continue
+			}
+			text, _ := e["text"].(string)
+			if text != "" {
+				out = append(out, LiveProgressEvent{Type: "agent_reasoning", LineIndex: idx, Text: text})
+			}
+		}
+	}
+	return out
+}
+
+func progressLineIndex(v any) (int, bool) {
+	n, ok := v.(json.Number)
+	if !ok {
+		return 0, false
+	}
+	i, err := n.Int64()
+	if err != nil || i < 0 || int64(int(i)) != i {
+		return 0, false
+	}
+	return int(i), true
+}
+
+func progressPayloadText(v any, typ string) string {
+	if s, ok := v.(string); ok {
+		decoded, err := DecodeAny([]byte(s))
+		if err != nil {
+			return ""
+		}
+		v = decoded
+	}
+	if m, ok := v.(map[string]any); ok {
+		if payload, ok := m["payload"]; ok {
+			v = payload
+		}
+		if p, ok := v.(map[string]any); ok {
+			key := "message"
+			if typ == "agent_reasoning" {
+				key = "text"
+			}
+			if s, ok := p[key].(string); ok {
+				return s
+			}
+		}
+	}
+	return ""
 }
 
 func (c *Client) statusOf(status string) string {

@@ -452,12 +452,17 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 			}
 		}
 	}()
-	defer func() {
-		close(heartbeatStop)
-		heartbeatWG.Wait()
-	}()
+	var heartbeatOnce sync.Once
+	stopHeartbeat := func() {
+		heartbeatOnce.Do(func() {
+			close(heartbeatStop)
+			heartbeatWG.Wait()
+		})
+	}
+	defer stopHeartbeat()
 
 	fail := func(runErr error) {
+		stopHeartbeat()
 		h.log.Error("responses 流式失败", "err", runErr, "chainKey", turn.chainKey)
 		middleware.RecordLogError(r, "responses 流式失败: %v", runErr)
 		// error.code 决定 Codex 怎么处理：context_length_exceeded 触发压缩，其余当断线重连。
@@ -470,15 +475,20 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 		// 桥模式不能边收边发：必须先拿到完整回复才能判断它是
 		// 工具调用（```codex-exec 块）还是纯文本，缓冲后统一输出。
 		var sb strings.Builder
+		progress := &responsesProgress{writer: sw}
 		emit := func(d Delta) error {
 			sb.WriteString(d.Text)
-			return nil
+			return progress.emit(d)
 		}
 		res, runErr := h.runResponses(r, runReq, emit)
+		stopHeartbeat()
 		if runErr != nil {
 			if !errors.Is(runErr, context.Canceled) {
 				fail(runErr)
 			}
+			return
+		}
+		if err := progress.finish(); err != nil {
 			return
 		}
 		h.recordResponsesTurn(runReq, turn, res)
@@ -495,6 +505,7 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 		}
 
 		if js != "" {
+			outputIndex := len(progress.items)
 			callID := newID("ctc_")
 			var item string
 			if turn.execKind == "function" {
@@ -503,7 +514,7 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 				item = customToolCallItemJSON(callID, js, turn.execToolName)
 			}
 			done := AppendResponsesEvent(buf[:0], ResponsesEvent{
-				Type: "response.output_item.added", ItemJSON: item,
+				Type: "response.output_item.added", ItemJSON: item, OutputIndex: outputIndex,
 			})
 			if err := sw.WriteRaw(done); err != nil {
 				return
@@ -518,7 +529,7 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 				}
 			}
 			done = AppendResponsesEvent(buf[:0], ResponsesEvent{
-				Type: "response.output_item.done", ItemJSON: item,
+				Type: "response.output_item.done", ItemJSON: item, OutputIndex: outputIndex,
 			})
 			if err := sw.WriteRaw(done); err != nil {
 				return
@@ -526,7 +537,7 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 			done = AppendResponsesEvent(buf[:0], ResponsesEvent{
 				Type:       "response.completed",
 				ResponseID: id, Model: publicModel, CreatedAt: created,
-				OutputJSON: "[" + item + "]",
+				OutputJSON: progress.output(json.RawMessage(item)),
 				Usage:      usage,
 			})
 			_ = sw.WriteRaw(done)
@@ -534,7 +545,13 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 		}
 
 		// 纯文本：桥模式下一次性给出（模型已完整生成，无需伪增量）。
-		_ = emitTextResponseEvents(sw, &buf, id, publicModel, created, itemID, stripExecFence(text), usage)
+		for _, typ := range []string{"response.output_item.added", "response.content_part.added"} {
+			buf = AppendResponsesEvent(buf[:0], ResponsesEvent{Type: typ, ItemID: itemID, OutputIndex: len(progress.items)})
+			if err := sw.WriteRaw(buf); err != nil {
+				return
+			}
+		}
+		_ = emitTextResponseEventsWithProgress(sw, &buf, id, publicModel, created, itemID, stripExecFence(text), usage, len(progress.items), progress)
 		return
 	}
 
@@ -551,7 +568,11 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 		return
 	}
 
+	progress := &responsesProgress{writer: sw, startIndex: 1}
 	emit := func(d Delta) error {
+		if err := progress.emit(d); err != nil {
+			return err
+		}
 		if d.Text == "" {
 			return nil
 		}
@@ -561,10 +582,14 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 		return sw.WriteRaw(buf)
 	}
 	res, runErr := h.runResponses(r, runReq, emit)
+	stopHeartbeat()
 	if runErr != nil {
 		if !errors.Is(runErr, context.Canceled) {
 			fail(runErr)
 		}
+		return
+	}
+	if err := progress.finish(); err != nil {
 		return
 	}
 	h.recordResponsesTurn(runReq, turn, res)
@@ -576,7 +601,7 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 		usage = res.Usage
 	}
 	// 收尾事件必须逐个发全，否则 SDK 会一直等 response.completed。
-	_ = emitTextResponseEvents(sw, &buf, id, publicModel, created, itemID, text, usage)
+	_ = emitTextResponseEventsWithProgress(sw, &buf, id, publicModel, created, itemID, text, usage, 0, progress)
 }
 
 // bridgeExecJS 从桥模式回复里取出要交给客户端执行的 JS。
@@ -610,6 +635,10 @@ func (h *Handler) bridgeExecJS(r *http.Request, turn *responsesTurn, text string
 // output_text.done -> content_part.done -> output_item.done -> completed。
 // 返回第一个写错误（如有）。
 func emitTextResponseEvents(sw *sse.Writer, buf *[]byte, id, publicModel string, created int64, itemID, text string, usage *prism.Usage) error {
+	return emitTextResponseEventsWithProgress(sw, buf, id, publicModel, created, itemID, text, usage, 0, nil)
+}
+
+func emitTextResponseEventsWithProgress(sw *sse.Writer, buf *[]byte, id, publicModel string, created int64, itemID, text string, usage *prism.Usage, outputIndex int, progress *responsesProgress) error {
 	events := []ResponsesEvent{
 		{Type: "response.output_text.done", ItemID: itemID, Text: text},
 		{Type: "response.content_part.done", ItemID: itemID, Text: text},
@@ -618,6 +647,10 @@ func emitTextResponseEvents(sw *sse.Writer, buf *[]byte, id, publicModel string,
 			CreatedAt: created, ItemID: itemID, Text: text, Usage: usage},
 	}
 	for _, ev := range events {
+		ev.OutputIndex = outputIndex
+		if progress != nil && ev.Type == "response.completed" {
+			ev.OutputJSON = progress.output(responseTextItem(itemID, text))
+		}
 		*buf = AppendResponsesEvent((*buf)[:0], ev)
 		if err := sw.WriteRaw(*buf); err != nil {
 			return err

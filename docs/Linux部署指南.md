@@ -186,6 +186,11 @@ curl -N http://127.0.0.1:8787/v1/chat/completions \
 `accounts.json` 是凭据导入源，不是账号列表的唯一存储。手动从文件移除账号不会删除 SQLite 中的账号；请在网页中删除或停用。空文件或解析失败也不会清空已保存的账号。
 
 成功刷新后的 Cookie/Token 自动持久化到 SQLite，修改设置、重载和重启不会回滚到旧值。
+自动刷新默认开启（`creds.auto_refresh: true`），默认在到期前 5 分钟尝试，
+后台根据实际到期时间安排下一次检查；`refresh_interval: 10m` 是最长巡检间隔，并非固定等待时间。
+单账号刷新有超时和失败退避，账号间最多四个并行刷新。认证失败会唤醒后台检查，不会重放已经开始的推理。
+必须仍有有效的 refresh token 或可续期 Cookie；只有 access token 无法永久续期。
+开启自动刷新时，SQLite 初始化失败会明确阻止启动，以免轮换凭据丢失；请检查安装目录及 `secrets` 的写权限。
 `HTTP 401 token_invalidated` 表示登录令牌被上游撤销，需要重新登录 Prism 并重新导入最新 Cookie；
 Plus/Pro 订阅不延长登录凭据有效期。`/auth/session` 未下发新会话 Cookie 的警告本身不证明账号失败，以实际校验结果为准。
 403 常见于代理出口或浏览器校验不一致；可配置 `upstream.http_proxy` 或账号代理，也可使用 Clash TUN。

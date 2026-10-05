@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/oai-prism/oaiprism/internal/config"
 )
@@ -22,6 +24,75 @@ func newCookieRefreshTestRefresher(t *testing.T, baseURL string) *Refresher {
 	}
 	t.Cleanup(refresher.client.CloseIdle)
 	return refresher
+}
+
+func TestRefresh_ReplacesAccessTokenExpiry(t *testing.T) {
+	expires := time.Now().Add(time.Hour).Truncate(time.Second)
+	token := makeJWT(t, map[string]any{"exp": expires.Unix()})
+	for _, oauth := range []bool{false, true} {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if oauth {
+				_ = json.NewEncoder(w).Encode(map[string]any{"access_token": token, "refresh_token": "rotated"})
+			} else {
+				_ = json.NewEncoder(w).Encode(map[string]any{"accessToken": token, "expires": expires.Add(time.Hour).Format(time.RFC3339)})
+			}
+		}))
+		refresher := newCookieRefreshTestRefresher(t, upstream.URL)
+		old := &Credential{AccessToken: "old", RefreshToken: "refresh", SessionToken: "session", ExpiresAt: time.Now().Add(-time.Hour)}
+		var next *Credential
+		var err error
+		if oauth {
+			next, err = refresher.RefreshOAuth(context.Background(), old)
+		} else {
+			next, err = refresher.FetchSession(context.Background(), old)
+		}
+		upstream.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !next.ExpiresAt.Equal(expires) || !old.Expired(time.Now()) {
+			t.Fatalf("oauth=%v expiry=%v, want=%v; input must remain expired", oauth, next.ExpiresAt, expires)
+		}
+	}
+}
+
+func TestFetchSessionOpaqueTokenUsesBoundedRecheck(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"accessToken": "opaque-new-token", "expires": time.Now().Add(24 * time.Hour).Format(time.RFC3339)})
+	}))
+	defer upstream.Close()
+	refresher := newCookieRefreshTestRefresher(t, upstream.URL)
+	now := time.Now()
+	next, err := refresher.FetchSession(context.Background(), &Credential{AccessToken: "old", SessionToken: "session", ExpiresAt: now.Add(-time.Minute)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !next.ExpiresAt.After(now.Add(29*time.Minute)) || next.ExpiresAt.After(time.Now().Add(30*time.Minute)) {
+		t.Fatalf("opaque token used session lifetime as access expiry: %s", next.ExpiresAt)
+	}
+}
+
+func TestRefresh_FallbackAttemptsSessionOnce(t *testing.T) {
+	var sessions atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/oauth/token" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
+			return
+		}
+		sessions.Add(1)
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"token_invalidated"}`))
+	}))
+	defer upstream.Close()
+	refresher := newCookieRefreshTestRefresher(t, upstream.URL)
+	_, err := refresher.Refresh(context.Background(), &Credential{AccessToken: "old", RefreshToken: "refresh", SessionToken: "session"})
+	if err == nil || sessions.Load() != 1 {
+		t.Fatalf("session attempts=%d, error=%v", sessions.Load(), err)
+	}
 }
 
 func TestFetchSession_SynchronizesRotatedCookieTokens(t *testing.T) {

@@ -105,6 +105,7 @@ export class ChatRepositoryImpl implements IChatRepository {
                 content: m.status === 'loading' ? `${content ? content + '\n\n' : ''}[请求失败] 响应未确认完成，请重新发送` : content,
                 attachments,
                 reasoning: m.reasoning || '',
+                progress: typeof m.progress === 'string' ? m.progress : '',
                 status: m.status === 'loading' ? 'error' : m.status || 'success',
                 createdAt: m.created_at || new Date().toISOString(),
               };
@@ -201,6 +202,7 @@ export class ChatRepositoryImpl implements IChatRepository {
     const messagePath = `/admin/chat/sessions/${encodeURIComponent(sessionId)}/messages`;
     let fullAssistantText = '';
     let fullAssistantReasoning = '';
+    let fullAssistantProgress = '';
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     const saveAssistant = async (status: 'loading' | 'success' | 'error', failure?: string) => {
       try {
@@ -209,6 +211,7 @@ export class ChatRepositoryImpl implements IChatRepository {
           role: 'assistant',
           content: failure ? `${fullAssistantText ? fullAssistantText + '\n\n' : ''}[请求失败] ${failure}` : fullAssistantText,
           reasoning: fullAssistantReasoning,
+          progress: fullAssistantProgress,
           status,
         });
       } catch {
@@ -305,9 +308,12 @@ export class ChatRepositoryImpl implements IChatRepository {
         if (delta) {
           const textChunk = delta.content || '';
           const reasoningChunk = delta.reasoning_content || delta.reasoning || '';
+          // 上游 agent_message 进度：独立累积，不并入 content / reasoning
+          const progressChunk = typeof delta.progress_content === 'string' ? delta.progress_content : '';
           fullAssistantText += textChunk;
           fullAssistantReasoning += reasoningChunk;
-          onChunk?.(textChunk, reasoningChunk);
+          fullAssistantProgress += progressChunk;
+          onChunk?.(textChunk, reasoningChunk, progressChunk);
         }
       };
 

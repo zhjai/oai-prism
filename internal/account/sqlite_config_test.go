@@ -152,7 +152,7 @@ func TestSQLiteUpdateCredentialPreservesDashboardSettings(t *testing.T) {
 	a.Name, a.Proxy, a.MaxConcurrency, a.Weight = "Dashboard", "http://127.0.0.1:1234", 0, 5
 	a.Enabled, a.RatePerSecond, a.RateBurst, a.Tags = &enabled, 0.75, 6, []string{"dashboard"}
 	a.Headers["X-Edited"], a.Headers["X-Dashboard"] = "dashboard", "keep"
-	a.Cookies, a.SessionToken = "device=dashboard", "session-dashboard"
+	a.Cookies = "device=dashboard"
 	if err := s.SaveAccount(a); err != nil {
 		t.Fatal(err)
 	}
@@ -161,6 +161,7 @@ func TestSQLiteUpdateCredentialPreservesDashboardSettings(t *testing.T) {
 	}
 	want := a
 	want.AccessToken, want.RefreshToken, want.AccountID, want.ExpiresAt = next.AccessToken, next.RefreshToken, next.AccountID, &next.ExpiresAt
+	want.SessionToken = next.SessionToken
 	want.Headers["X-New"] = "new"
 	delete(want.Headers, "X-Remove")
 	if got := loadConfigTestAccount(t, s); !reflect.DeepEqual(got, want) {
@@ -190,7 +191,7 @@ func TestSQLiteUpdateCredentialRejectsReplacedCookie(t *testing.T) {
 		t.Fatal(err)
 	}
 	expected := creds.FromAccountConfig(a)
-	a.CookieMap["other"] = "changed"
+	a.CookieMap[creds.CookiePrismSessionToken] = "changed-session"
 	if err := s.SaveAccount(a); err != nil {
 		t.Fatal(err)
 	}

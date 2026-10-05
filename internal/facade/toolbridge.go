@@ -373,6 +373,7 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string) []prism.InputIt
 	var blocks []struct {
 		Type   string `json:"type"`
 		Role   string `json:"role"`
+		Phase  string `json:"phase"`
 		Name   string `json:"name"`
 		CallID string `json:"call_id"`
 		// 工具调用的参数：custom_tool_call 用 input，function_call 用 arguments。
@@ -387,6 +388,14 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string) []prism.InputIt
 	if err := json.Unmarshal(raw, &blocks); err != nil {
 		return nil
 	}
+	filtered := blocks[:0]
+	for _, b := range blocks {
+		if (b.Type == "" || b.Type == "message") && b.Phase == "commentary" {
+			continue
+		}
+		filtered = append(filtered, b)
+	}
+	blocks = filtered
 
 	textOf := func(r json.RawMessage) string {
 		if len(r) == 0 {

@@ -123,9 +123,14 @@ func (r *Refresher) FetchSession(ctx context.Context, cur *Credential) (*Credent
 	next.Source = "session"
 	next.UpdatedAt = time.Now()
 
+	tokenChanged := false
+	tokenExpiryKnown := false
 	if tok := firstNonEmpty(sr.AccessToken, sr.AccessTokenSnake); tok != "" {
 		next.AccessToken = tok
+		next.ExpiresAt = time.Time{}
 		next.applyJWT(tok)
+		tokenChanged = true
+		tokenExpiryKnown = !next.ExpiresAt.IsZero()
 	}
 	if id := firstNonEmpty(sr.Account.ID, sr.AccountIDSnake); id != "" {
 		next.AccountID = id
@@ -146,6 +151,14 @@ func (r *Refresher) FetchSession(ctx context.Context, cur *Credential) (*Credent
 			if next.ExpiresAt.IsZero() {
 				next.ExpiresAt = t
 			}
+		}
+	}
+	if tokenChanged && !tokenExpiryKnown {
+		// Session expiry does not establish an opaque access token's lifetime.
+		// Use a bounded recheck time, as in the OAuth fallback.
+		recheck := time.Now().Add(30 * time.Minute)
+		if next.ExpiresAt.IsZero() || next.ExpiresAt.After(recheck) {
+			next.ExpiresAt = recheck
 		}
 	}
 
@@ -252,6 +265,7 @@ func (r *Refresher) RefreshOAuth(ctx context.Context, cur *Credential) (*Credent
 	next := cur.Clone()
 	next.Source = "oauth"
 	next.AccessToken = or.AccessToken
+	next.ExpiresAt = time.Time{}
 	next.UpdatedAt = time.Now()
 	if or.RefreshToken != "" {
 		// 上游可能轮换 refresh_token，必须跟进，否则下次刷新会失败。
@@ -313,17 +327,7 @@ func (r *Refresher) Refresh(ctx context.Context, cur *Credential) (*Credential, 
 		// 因为 session cookie 往往还活着。
 	}
 
-	if cur.SessionToken != "" || HasSessionCookie(cur.CookieHeader) {
-		next, err := r.FetchSession(ctx, cur)
-		if err == nil {
-			return next, nil
-		}
-		if firstErr == nil {
-			firstErr = err
-		}
-	}
-
-	if cur.AccessToken != "" {
+	if cur.SessionToken != "" || HasSessionCookie(cur.CookieHeader) || cur.AccessToken != "" {
 		next, err := r.FetchSession(ctx, cur)
 		if err == nil {
 			return next, nil

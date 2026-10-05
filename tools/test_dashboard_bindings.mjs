@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { pathToFileURL } from 'node:url';
 import { mkdir } from 'node:fs/promises';
+import { createServer } from 'node:http';
 
 const playwright = await import(process.env.PLAYWRIGHT_MODULE
   ? pathToFileURL(process.env.PLAYWRIGHT_MODULE).href : 'playwright');
@@ -11,6 +12,8 @@ if (!baseURL) throw new Error('Run through TestDashboardBrowser with its simulat
 const adminKey = 'browser-test-admin-key';
 const headers = { Authorization: `Bearer ${adminKey}`, 'Content-Type': 'application/json' };
 const errors = [];
+let progressFixture;
+let releaseProgressFinal;
 const bootstrap = process.env.OAIPRISM_BROWSER_BOOTSTRAP === '1';
 page.on('pageerror', (error) => errors.push(error.message));
 if (!bootstrap) await page.addInitScript(() => {
@@ -28,6 +31,48 @@ const waitUntil = async (check) => {
   }
   throw new Error('browser state failed to persist');
 };
+const renameDialog = page.getByRole('dialog', { name: '编辑密钥名称', exact: true });
+const keyRow = (key) => page.locator(`tr[data-row-key=${JSON.stringify(key)}]`);
+const longKeyName = '𠮷'.repeat(64);
+const readKey = async (key) => {
+  const credential = await page.evaluate(() => localStorage.getItem('oaiprism_api_key'));
+  const response = await page.request.get(`${baseURL}/admin/apikeys`, { headers: { Authorization: `Bearer ${credential}` } });
+  assert.equal(response.status(), 200);
+  const item = (await response.json()).find((candidate) => candidate.key === key);
+  assert.ok(item, 'renamed key remains in the authenticated inventory');
+  return item;
+};
+const openRename = async (key) => {
+  await keyRow(key).getByRole('button', { name: /^编辑名称/ }).click();
+  await renameDialog.waitFor();
+};
+const saveRename = async (key, draft) => {
+  await renameDialog.getByLabel('密钥名称', { exact: true }).fill(draft);
+  const response = page.waitForResponse((r) => r.url() === `${baseURL}/admin/apikeys/${encodeURIComponent(key)}` && r.request().method() === 'PATCH');
+  await renameDialog.getByRole('button', { name: /保存名称/ }).click();
+  const saved = await response;
+  assert.deepEqual(saved.request().postDataJSON(), { name: draft.trim() });
+  assert.equal(saved.status(), 200);
+  await renameDialog.waitFor({ state: 'hidden' });
+};
+const keySnapshot = async (key) => ({
+  record: await readKey(key),
+  cells: (await keyRow(key).getByRole('cell').allTextContents()).slice(1),
+  credential: await page.evaluate(() => localStorage.getItem('oaiprism_api_key')),
+});
+const assertRenameOnly = async (key, before, name) => {
+  assert.deepEqual(await readKey(key), { ...before.record, name });
+  assert.deepEqual((await keyRow(key).getByRole('cell').allTextContents()).slice(1), before.cells);
+  assert.equal(await page.evaluate(() => localStorage.getItem('oaiprism_api_key')), before.credential);
+  assert.equal((await keyRow(key).innerText()).includes(key), false);
+  await page.evaluate(() => {
+    window.__renameCopied = null;
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async (value) => { window.__renameCopied = value; } } });
+  });
+  await keyRow(key).getByRole('button', { name: '复制密钥', exact: true }).click();
+  assert.equal(await page.evaluate(() => window.__renameCopied), key);
+  assert.equal((await keyRow(key).innerText()).includes(key), false);
+};
 try {
   if (bootstrap) {
     await page.goto(`${baseURL}/dashboard/`);
@@ -44,13 +89,25 @@ try {
     assert.equal(await page.getByText('连接网关', { exact: true }).count(), 0);
     const accounts = await fetch(`${baseURL}/admin/accounts`, { headers: { Authorization: `Bearer ${created.key}` } });
     assert.equal(accounts.status, 200);
+    const before = await keySnapshot(created.key);
+    assert.ok(before.cells.join(' ').includes('使用中'));
+    await openRename(created.key);
+    await saveRename(created.key, 'Renamed current browser key');
+    await assertRenameOnly(created.key, before, 'Renamed current browser key');
     await page.getByRole('dialog').getByRole('button', { name: '关闭', exact: true }).click();
     await page.reload();
     await page.getByRole('menuitem', { name: '账号与计划池' }).click();
     await page.getByRole('switch', { name: 'Account A 启用状态' }).waitFor();
     assert.equal(await page.getByText('连接网关', { exact: true }).count(), 0);
+    await page.getByRole('button', { name: /API 密钥/ }).click();
+    await keyRow(created.key).getByRole('button', { name: /^编辑名称/ }).waitFor();
+    await assertRenameOnly(created.key, before, 'Renamed current browser key');
+    await openRename(created.key);
+    assert.equal(await renameDialog.getByLabel('密钥名称', { exact: true }).inputValue(), 'Renamed current browser key');
+    await renameDialog.getByRole('button', { name: /^取\s*消$/ }).click();
+    await renameDialog.waitFor({ state: 'hidden' });
     assert.deepEqual(errors, []);
-    console.log('PASS: first browser key is retained, authenticated and masked after bootstrap and reload');
+    console.log('PASS: first browser key rename preserves current marker, credential, masking, copying, authentication and reload persistence');
   } else {
   await page.goto(`${baseURL}/dashboard/`);
   await page.getByRole('menuitem', { name: '账号与计划池' }).click();
@@ -178,6 +235,95 @@ try {
   assert.equal(await page.evaluate(() => localStorage.getItem('oaiprism_api_key')), adminKey);
   const row = page.getByRole('row').filter({ hasText: 'Browser multi-account' });
   assert.equal((await row.innerText()).includes(testKey.key), false);
+  const beforeRename = await keySnapshot(testKey.key);
+  const renameRequests = [];
+  const recordRename = (request) => {
+    if (request.method() === 'PATCH' && request.url() === `${baseURL}/admin/apikeys/${encodeURIComponent(testKey.key)}`) renameRequests.push(request);
+  };
+  page.on('request', recordRename);
+  await openRename(testKey.key);
+  const renameInput = renameDialog.getByLabel('密钥名称', { exact: true });
+  const renameSave = renameDialog.getByRole('button', { name: /保存名称/ });
+  assert.equal(await renameInput.inputValue(), 'Browser multi-account');
+  assert.equal(await renameSave.isDisabled(), true);
+  await renameInput.fill('Cancelled browser name');
+  await renameDialog.getByRole('button', { name: /^取\s*消$/ }).click();
+  await renameDialog.waitFor({ state: 'hidden' });
+  assert.equal(renameRequests.length, 0);
+  await assertRenameOnly(testKey.key, beforeRename, 'Browser multi-account');
+  await openRename(testKey.key);
+  assert.equal(await renameInput.inputValue(), 'Browser multi-account');
+  await renameInput.fill(`${longKeyName}𠮷`);
+  await renameDialog.getByText('名称最多 64 个字符', { exact: true }).waitFor();
+  assert.equal(await renameSave.isDisabled(), true);
+  await renameInput.fill('invalid\u0007name');
+  await renameDialog.getByText('名称不能包含换行、制表符等控制字符', { exact: true }).waitFor();
+  assert.equal(await renameSave.isDisabled(), true);
+  assert.equal(renameRequests.length, 0);
+  await renameInput.fill('  Browser renamed after retry  ');
+  const renameURL = `${baseURL}/admin/apikeys/${encodeURIComponent(testKey.key)}`;
+  await page.route(renameURL, async (route) => {
+    if (route.request().method() === 'PATCH') await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'synthetic rename unavailable' }) });
+    else await route.continue();
+  });
+  await renameSave.click();
+  await renameDialog.getByText('保存失败：synthetic rename unavailable', { exact: true }).waitFor();
+  assert.equal(await renameInput.inputValue(), '  Browser renamed after retry  ');
+  assert.equal(await renameSave.isEnabled(), true);
+  assert.deepEqual(await readKey(testKey.key), beforeRename.record);
+  await page.unroute(renameURL);
+  let releaseRename;
+  let renamePending = false;
+  const renameGate = new Promise((resolve) => { releaseRename = resolve; });
+  await page.route(renameURL, async (route) => {
+    if (route.request().method() === 'PATCH') {
+      renamePending = true;
+      await renameGate;
+    }
+    await route.continue();
+  });
+  const savingRename = saveRename(testKey.key, '  Browser renamed after retry  ');
+  void savingRename.catch(() => {});
+  const parentKeysDialog = page.getByRole('dialog', { name: /对外 API Key 管理与接入指引/ });
+  try {
+    await waitUntil(async () => renamePending && await renameInput.isDisabled());
+    assert.equal(await parentKeysDialog.getByRole('button', { name: /^完\s*成$/ }).isDisabled(), true);
+    assert.equal(await renameDialog.getByRole('button', { name: /^取\s*消$/ }).isDisabled(), true);
+    assert.equal(await parentKeysDialog.getByRole('button', { name: '关闭', exact: true }).count(), 0);
+    await page.keyboard.press('Escape');
+    assert.equal(await renameDialog.isVisible(), true);
+    assert.equal(await parentKeysDialog.isVisible(), true);
+  } finally {
+    releaseRename();
+  }
+  await savingRename;
+  await page.unroute(renameURL);
+  assert.equal(await parentKeysDialog.getByRole('button', { name: /^完\s*成$/ }).isEnabled(), true);
+  assert.equal(await parentKeysDialog.getByRole('button', { name: '关闭', exact: true }).count(), 1);
+  await assertRenameOnly(testKey.key, beforeRename, 'Browser renamed after retry');
+  await page.getByRole('dialog').getByRole('button', { name: '关闭', exact: true }).click();
+  await page.getByRole('dialog').waitFor({ state: 'hidden' });
+  await page.getByRole('button', { name: /API 密钥/ }).click();
+  await keyRow(testKey.key).getByRole('button', { name: /^编辑名称/ }).waitFor();
+  await assertRenameOnly(testKey.key, beforeRename, 'Browser renamed after retry');
+  await page.reload();
+  await page.getByRole('button', { name: /API 密钥/ }).click();
+  await keyRow(testKey.key).getByRole('button', { name: /^编辑名称/ }).waitFor();
+  await assertRenameOnly(testKey.key, beforeRename, 'Browser renamed after retry');
+  await openRename(testKey.key);
+  await saveRename(testKey.key, '   ');
+  await keyRow(testKey.key).getByText('未命名', { exact: true }).waitFor();
+  await assertRenameOnly(testKey.key, beforeRename, '');
+  await openRename(testKey.key);
+  await saveRename(testKey.key, longKeyName);
+  await assertRenameOnly(testKey.key, beforeRename, longKeyName);
+  await openRename(testKey.key);
+  assert.equal(await renameInput.inputValue(), longKeyName);
+  await saveRename(testKey.key, 'Browser multi-account');
+  await assertRenameOnly(testKey.key, beforeRename, 'Browser multi-account');
+  assert.equal(renameRequests.length, 5);
+  for (const request of renameRequests) assert.deepEqual(Object.keys(request.postDataJSON()), ['name']);
+  page.off('request', recordRename);
   await row.getByRole('button', { name: '显示密钥', exact: true }).click();
   assert.equal((await row.innerText()).includes(testKey.key), true);
   await page.getByRole('tab', { name: '客户端接入代码示例', exact: true }).click();
@@ -215,13 +361,64 @@ try {
   assert.equal(request.headers()['x-oaiprism-account'], 'b');
   await page.getByText('你好，这是一段流式回答。（完）', { exact: true }).waitFor();
   await waitUntil(async () => await page.getByRole('combobox', { name: '调试账号' }).isEnabled());
+  // Hold the final frame until the browser proves progress is rendered separately.
+  const progressText = 'synthetic agent_message: checking upstream state';
+  const finalText = 'synthetic final answer without progress';
+  const finalGate = new Promise((resolve) => { releaseProgressFinal = resolve; });
+  let fixtureRequest;
+  progressFixture = createServer(async (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Headers', '*');
+    if (req.method === 'OPTIONS') { res.writeHead(204).end(); return; }
+    const body = [];
+    for await (const chunk of req) body.push(chunk);
+    fixtureRequest = { headers: req.headers, body: JSON.parse(Buffer.concat(body).toString()) };
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
+    res.write(`data: ${JSON.stringify({ choices: [{ delta: { progress_content: progressText } }] })}\n\n`);
+    await finalGate;
+    res.end(`data: ${JSON.stringify({ choices: [{ delta: { content: finalText } }] })}\n\ndata: [DONE]\n\n`);
+  });
+  await new Promise((resolve) => progressFixture.listen(0, '127.0.0.1', resolve));
+  await page.route('**/v1/chat/completions', (route) => route.continue({ url: `http://127.0.0.1:${progressFixture.address().port}/v1/chat/completions` }));
+  const chatInput = page.getByPlaceholder('输入调试指令，例如：生成一个鹈鹕骑自行车的 SVG，用 HTML 实现...');
+  await chatInput.fill('browser delayed progress regression');
+  await chatInput.press('Enter');
+  const progressRegion = page.getByRole('region', { name: '上游进度', exact: true });
+  await progressRegion.getByText(progressText, { exact: true }).waitFor();
+  assert.equal(await progressRegion.getAttribute('aria-busy'), 'true');
+  assert.equal(await page.getByText(finalText, { exact: true }).count(), 0);
+  assert.equal(await progressRegion.locator('..').locator('.md-body').count(), 0);
+  const progressMessagesPath = `/admin/chat/sessions/${encodeURIComponent(fixtureRequest.headers['x-oaiprism-session'])}/messages`;
+  const pendingMessage = (await api('GET', progressMessagesPath)).at(-1);
+  assert.equal(pendingMessage.role, 'assistant');
+  assert.equal(pendingMessage.status, 'loading');
+  assert.equal(pendingMessage.content, '');
+  releaseProgressFinal();
+  await page.getByText(finalText, { exact: true }).waitFor();
+  await waitUntil(async () => await progressRegion.getAttribute('aria-busy') === 'false');
+  assert.equal(await progressRegion.locator('..').locator('.md-body').innerText(), finalText);
+  await waitUntil(async () => {
+    const saved = (await api('GET', progressMessagesPath)).at(-1);
+    return saved.status === 'success' && saved.content === finalText && saved.progress === progressText;
+  });
+  await page.unroute('**/v1/chat/completions');
+  await new Promise((resolve) => progressFixture.close(resolve));
+  progressFixture = null;
+  await page.reload();
+  await page.getByRole('menuitem', { name: 'Chat 调试台' }).click();
+  await progressRegion.getByText(progressText, { exact: true }).waitFor();
+  assert.equal(await progressRegion.getAttribute('aria-busy'), 'false');
+  assert.equal(await progressRegion.locator('..').locator('.md-body').innerText(), finalText);
   // The account can be disabled by an administrator after the selector loaded.
   // The web Chat must render the server's SSE error instead of a false success.
   await api('PUT', '/admin/accounts/b', { enabled: false });
   const failedSend = page.waitForRequest((r) => r.url().endsWith('/v1/chat/completions') && r.method() === 'POST');
   await page.getByPlaceholder('输入调试指令，例如：生成一个鹈鹕骑自行车的 SVG，用 HTML 实现...').fill('disabled account smoke');
   await page.getByPlaceholder('输入调试指令，例如：生成一个鹈鹕骑自行车的 SVG，用 HTML 实现...').press('Enter');
-  assert.equal((await failedSend).headers()['x-oaiprism-account'], 'b');
+  const failedRequest = await failedSend;
+  assert.equal(failedRequest.headers()['x-oaiprism-account'], 'b');
+  assert.equal(JSON.stringify(failedRequest.postDataJSON().messages).includes(progressText), false);
+  assert.ok(failedRequest.postDataJSON().messages.some((message) => message.role === 'assistant' && message.content === finalText));
   await page.getByText('[请求失败] 指定账号已停用或暂不可用: b', { exact: true }).waitFor();
   await api('PUT', '/admin/accounts/b', { enabled: true });
   await api('PUT', `/admin/apikeys/${encodeURIComponent(testKey.key)}/bindings`, { account_ids: ['b'] });
@@ -298,6 +495,30 @@ try {
         await page.getByLabel('完整 Cookie', { exact: true }).waitFor({ state: 'hidden' });
         await page.locator('header').getByRole('button').filter({ has: page.locator('[aria-label="key"]') }).click();
         const keysDialog = page.getByRole('dialog');
+        await openRename(testKey.key);
+        await saveRename(testKey.key, longKeyName);
+        await openRename(testKey.key);
+        await waitForLayout();
+        const renameBounds = await renameDialog.boundingBox();
+        assert.ok(renameBounds && renameBounds.x >= 0 && renameBounds.y >= 0 && renameBounds.x + renameBounds.width <= width && renameBounds.y + renameBounds.height <= height, `${name} ${mode} rename dialog exceeds viewport`);
+        const renameParts = [
+          renameDialog.locator('.ant-modal-title'),
+          renameDialog.getByLabel('密钥名称', { exact: true }),
+          renameDialog.getByRole('button', { name: /^取\s*消$/ }),
+          renameDialog.getByRole('button', { name: /保存名称/ }),
+        ];
+        const partBounds = [];
+        for (const part of renameParts) {
+          const bounds = await part.boundingBox();
+          assert.ok(bounds && bounds.width > 0 && bounds.height > 0 && bounds.x >= renameBounds.x && bounds.y >= renameBounds.y && bounds.x + bounds.width <= renameBounds.x + renameBounds.width && bounds.y + bounds.height <= renameBounds.y + renameBounds.height, `${name} ${mode} rename control outside dialog`);
+          partBounds.push(bounds);
+        }
+        assert.ok(partBounds[0].y + partBounds[0].height <= partBounds[1].y, `${name} ${mode} rename title overlaps input`);
+        assert.ok(partBounds[1].y + partBounds[1].height <= partBounds[2].y, `${name} ${mode} rename input overlaps footer`);
+        assert.ok(partBounds[2].x + partBounds[2].width <= partBounds[3].x, `${name} ${mode} rename footer buttons overlap`);
+        assert.equal((await renameDialog.innerText()).includes(testKey.key), false);
+        await page.screenshot({ path: `${directory}/${name}-${mode}-key-rename.png`, fullPage: true });
+        await saveRename(testKey.key, 'Browser multi-account');
         await keysDialog.getByRole('tab', { name: '客户端接入代码示例', exact: true }).click();
         await waitForLayout();
         const keysTitle = await keysDialog.locator('.ant-modal-title').boundingBox();
@@ -311,7 +532,7 @@ try {
     }
   }
   assert.deepEqual(errors, []);
-  console.log('PASS: account toggle, inventory failure preservation, direct verified Cookie import, expired Cookie rejection, explicit skip verification, malformed JSON rejection, batch wrapper, management credential preservation, multi-account key creation/edit, web Chat selection, restricted options, request header, inference, SSE failure, reload persistence, account deletion after reload');
+  console.log('PASS: account toggle, inventory failure preservation, direct verified Cookie import, expired Cookie rejection, explicit skip verification, malformed JSON rejection, batch wrapper, management credential preservation, multi-account key creation/edit, name-only rename/cancel/error/retry/persistence, pending rename dismissal blocked, empty and 64-codepoint Unicode names, mask/copy/identity/binding preservation, web Chat selection, delayed SSE progress before final, separate progress persistence and history exclusion, restricted options, request header, inference, SSE failure, reload persistence, account deletion after reload');
   }
 } catch (error) {
   console.error('Browser failure:', error);
@@ -328,5 +549,10 @@ try {
   console.error('Browser page state:', await page.locator('body').innerText());
   throw error;
 } finally {
+  releaseProgressFinal?.();
+  if (progressFixture) {
+    progressFixture.closeAllConnections();
+    await new Promise((resolve) => progressFixture.close(resolve));
+  }
   await browser.close();
 }

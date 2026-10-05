@@ -159,6 +159,9 @@ func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, runReq
 	}
 
 	emit := func(d Delta) error {
+		// Prism previews have no Anthropic thinking signatures. Keep them out
+		// of the text block instead of emitting unsigned thinking or narration
+		// that clients could persist as assistant answer/history.
 		if d.Text == "" {
 			return nil
 		}

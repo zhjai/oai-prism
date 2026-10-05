@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -60,6 +61,8 @@ func TestResponsesPublicIDStableAndContinues(t *testing.T) {
 				}
 				var publicID string
 				var result map[string]any
+				added := map[string]int{}
+				completedItems := map[string]map[string]any{}
 				if stream {
 					seenCreated, seenCompleted := false, false
 					for _, line := range strings.Split(output, "\n") {
@@ -69,6 +72,28 @@ func TestResponsesPublicIDStableAndContinues(t *testing.T) {
 						var event map[string]any
 						if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event); err != nil {
 							t.Fatalf("invalid SSE: %v", err)
+						}
+						if event["type"] == "response.output_item.added" || event["type"] == "response.output_item.done" {
+							item, ok := event["item"].(map[string]any)
+							if !ok {
+								t.Fatalf("missing stream item: %#v", event)
+							}
+							itemID, _ := item["id"].(string)
+							index, ok := event["output_index"].(float64)
+							if itemID == "" || !ok || index < 0 || index != float64(int(index)) {
+								t.Fatalf("invalid stream item identity: %#v", event)
+							}
+							if event["type"] == "response.output_item.added" {
+								if _, exists := added[itemID]; exists {
+									t.Fatalf("duplicate item addition: %q", itemID)
+								}
+								added[itemID] = int(index)
+							} else {
+								if prior, exists := added[itemID]; !exists || prior != int(index) {
+									t.Fatalf("item identity changed: %#v", event)
+								}
+								completedItems[itemID] = item
+							}
 						}
 						response, ok := event["response"].(map[string]any)
 						if !ok {
@@ -99,17 +124,51 @@ func TestResponsesPublicIDStableAndContinues(t *testing.T) {
 					}
 				}
 				items, _ := result["output"].([]any)
-				if len(items) != 1 {
-					t.Fatalf("unexpected output: %#v", result)
-				}
 				wantType := "message"
 				if mode == "bridge_custom" {
 					wantType = "custom_tool_call"
 				} else if mode == "bridge_function" {
 					wantType = "function_call"
 				}
-				if items[0].(map[string]any)["type"] != wantType {
-					t.Fatalf("wrong output branch: %#v", items[0])
+				finalCount, reasoningCount := 0, 0
+				for index, rawItem := range items {
+					item, ok := rawItem.(map[string]any)
+					if !ok {
+						t.Fatalf("invalid output item: %#v", rawItem)
+					}
+					if stream {
+						itemID, _ := item["id"].(string)
+						if streamedIndex, exists := added[itemID]; !exists || streamedIndex != index || !reflect.DeepEqual(completedItems[itemID], item) {
+							t.Fatalf("completed output differs from stream: %#v", item)
+						}
+					}
+					if item["type"] == "reasoning" {
+						reasoningCount++
+						summary, _ := item["summary"].([]any)
+						if len(summary) == 0 {
+							t.Fatalf("empty reasoning item: %#v", item)
+						}
+						for _, rawPart := range summary {
+							part, ok := rawPart.(map[string]any)
+							if !ok || part["type"] != "summary_text" {
+								t.Fatalf("invalid reasoning part: %#v", rawPart)
+							}
+							if text, ok := part["text"].(string); !ok || text == "" {
+								t.Fatalf("empty reasoning text: %#v", part)
+							}
+						}
+						continue
+					}
+					finalCount++
+					if item["type"] != wantType || item["phase"] == "commentary" {
+						t.Fatalf("wrong final output branch: %#v", item)
+					}
+				}
+				if finalCount != 1 || (stream && reasoningCount == 0) || (!stream && reasoningCount != 0) {
+					t.Fatalf("expected one final item with streamed reasoning: %#v", result)
+				}
+				if stream && (len(added) != len(items) || len(completedItems) != len(items)) {
+					t.Fatalf("streamed items missing from completed output: %#v", result)
 				}
 				cid := startConv(t, up, 0)
 				followup := fmt.Sprintf(`{"model":"gpt-5","stream":false,"input":"Continue the remembered conversation.","previous_response_id":%q}`, publicID)

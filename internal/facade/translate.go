@@ -345,20 +345,17 @@ func responsesChatMessages(raw json.RawMessage) []ChatMessage {
 	}
 
 	if trimmed[0] == '{' {
-		var one ChatMessage
-		if err := json.Unmarshal(raw, &one); err == nil && one.Role != "" {
-			return []ChatMessage{one}
+		var one struct {
+			ChatMessage
+			Phase string `json:"phase"`
+		}
+		if err := json.Unmarshal(raw, &one); err == nil && one.Role != "" && one.Phase != "commentary" {
+			return []ChatMessage{one.ChatMessage}
 		}
 		return nil
 	}
 
-	// 先按 chat 消息数组试。
-	var items []ChatMessage
-	if err := json.Unmarshal(raw, &items); err == nil && len(items) > 0 && items[0].Role != "" {
-		return items
-	}
-
-	// 再按带 type 的内容块数组试。
+	// Parse message arrays together with Responses item metadata.
 	//
 	// 注意跳过 additional_tools / function_call / function_call_output 等
 	// 非消息条目：Codex CLI 的 input 数组里混着工具声明与工具结果，
@@ -366,11 +363,15 @@ func responsesChatMessages(raw json.RawMessage) []ChatMessage {
 	var blocks []struct {
 		Type    string        `json:"type"`
 		Role    string        `json:"role"`
+		Phase   string        `json:"phase"`
 		Content StringOrArray `json:"content"`
 	}
 	if err := json.Unmarshal(raw, &blocks); err == nil {
 		chat := make([]ChatMessage, 0, len(blocks))
 		for _, b := range blocks {
+			if b.Phase == "commentary" {
+				continue
+			}
 			switch b.Type {
 			case "", "message":
 			default:

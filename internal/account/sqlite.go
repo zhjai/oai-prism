@@ -164,6 +164,7 @@ func (s *SQLiteStore) initSchema() error {
 		return fmt.Errorf("初始化 sqlite 表结构失败: %w", err)
 	}
 	for _, migration := range []struct{ table, column, definition string }{
+		{"chat_messages", "progress", "TEXT NOT NULL DEFAULT ''"},
 		{"accounts", "enabled", "INTEGER NOT NULL DEFAULT 1"},
 		{"accounts", "cookie_map", "TEXT NOT NULL DEFAULT 'null'"},
 		{"accounts", "session_token", "TEXT NOT NULL DEFAULT ''"},
@@ -503,59 +504,26 @@ func (s *SQLiteStore) UpdateCredential(id string, expected, next *creds.Credenti
 		return false, err
 	}
 	saved := creds.FromAccountConfig(current)
-	if saved.AccessToken != expected.AccessToken || saved.RefreshToken != expected.RefreshToken {
+	if credentialMaterialChanged(expected, saved) {
 		return false, nil
 	}
-	if saved.AccessToken == "" && saved.RefreshToken == "" {
-		if saved.SessionToken != expected.SessionToken ||
-			canonicalCredentialCookies(saved.EffectiveCookie()) != canonicalCredentialCookies(expected.EffectiveCookie()) {
-			return false, nil
-		}
-	}
+	merged := mergeRefreshCredential(saved, expected, next)
 
 	cookies, sessionToken := current.Cookies, current.SessionToken
-	if next.CookieHeader != expected.CookieHeader &&
-		canonicalCredentialCookies(saved.CookieHeader) == canonicalCredentialCookies(expected.CookieHeader) {
+	if merged.CookieHeader != saved.CookieHeader {
 		// A refreshed header already contains cookie_map values; retain one copy.
-		cookies, cookieMap = next.CookieHeader, "null"
+		cookies, cookieMap = merged.CookieHeader, "null"
 	}
-	if next.SessionToken != expected.SessionToken && saved.SessionToken == expected.SessionToken {
-		sessionToken = next.SessionToken
+	if merged.SessionToken != saved.SessionToken {
+		sessionToken = merged.SessionToken
 	}
-	if !next.ExpiresAt.Equal(expected.ExpiresAt) && saved.ExpiresAt.Equal(expected.ExpiresAt) {
+	if !merged.ExpiresAt.Equal(saved.ExpiresAt) {
 		expiresAt = ""
-		if !next.ExpiresAt.IsZero() {
-			expiresAt = next.ExpiresAt.Format(time.RFC3339Nano)
+		if !merged.ExpiresAt.IsZero() {
+			expiresAt = merged.ExpiresAt.Format(time.RFC3339Nano)
 		}
 	}
-	accountID := current.AccountID
-	if next.AccountID != expected.AccountID && saved.AccountID == expected.AccountID {
-		accountID = next.AccountID
-	}
-	// Apply only refresh changes whose original value still matches. A Dashboard
-	// edit to an unrelated header, or the same header, wins over a stale refresh.
-	for key, oldValue := range expected.Headers {
-		newValue, exists := next.Headers[key]
-		if currentValue, present := current.Headers[key]; present && currentValue == oldValue {
-			if !exists {
-				delete(current.Headers, key)
-			} else if newValue != oldValue {
-				current.Headers[key] = newValue
-			}
-		}
-	}
-	for key, value := range next.Headers {
-		if _, existed := expected.Headers[key]; existed {
-			continue
-		}
-		if _, present := current.Headers[key]; !present {
-			if current.Headers == nil {
-				current.Headers = make(map[string]string)
-			}
-			current.Headers[key] = value
-		}
-	}
-	encodedHeaders, err := json.Marshal(current.Headers)
+	encodedHeaders, err := json.Marshal(merged.Headers)
 	if err != nil {
 		return false, err
 	}
@@ -564,8 +532,8 @@ func (s *SQLiteStore) UpdateCredential(id string, expected, next *creds.Credenti
 		headers = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE id = ? AND access_token = ? AND refresh_token = ?
 		AND NOT EXISTS (SELECT 1 FROM deleted_accounts WHERE id = ?)`,
-		next.AccessToken, next.RefreshToken, cookies, cookieMap, sessionToken, expiresAt,
-		accountID, string(encodedHeaders), id, current.AccessToken, current.RefreshToken, id)
+		merged.AccessToken, merged.RefreshToken, cookies, cookieMap, sessionToken, expiresAt,
+		merged.AccountID, string(encodedHeaders), id, current.AccessToken, current.RefreshToken, id)
 	if err != nil {
 		return false, err
 	}
@@ -1290,6 +1258,7 @@ type ChatMessageRecord struct {
 	Role      string    `json:"role"`
 	Content   string    `json:"content"`
 	Reasoning string    `json:"reasoning"`
+	Progress  string    `json:"progress"`
 	Status    string    `json:"status"`
 	CreatedAt time.Time `json:"created_at"`
 }
@@ -1402,7 +1371,7 @@ func (s *SQLiteStore) ListChatMessages(sessionID string) ([]ChatMessageRecord, e
 	}
 
 	rows, err := s.db.Query(`
-		SELECT id, session_id, role, content, reasoning, status, created_at
+		SELECT id, session_id, role, content, reasoning, status, created_at, progress
 		FROM chat_messages
 		WHERE session_id = ?
 		ORDER BY created_at ASC
@@ -1416,7 +1385,7 @@ func (s *SQLiteStore) ListChatMessages(sessionID string) ([]ChatMessageRecord, e
 	for rows.Next() {
 		var m ChatMessageRecord
 		var cStr string
-		if err := rows.Scan(&m.ID, &m.SessionID, &m.Role, &m.Content, &m.Reasoning, &m.Status, &cStr); err != nil {
+		if err := rows.Scan(&m.ID, &m.SessionID, &m.Role, &m.Content, &m.Reasoning, &m.Status, &cStr, &m.Progress); err != nil {
 			continue
 		}
 		if t, err := time.Parse("2006-01-02 15:04:05", cStr); err == nil {
@@ -1447,14 +1416,15 @@ func (s *SQLiteStore) SaveChatMessage(m ChatMessageRecord) error {
 	}
 
 	query := `
-	INSERT INTO chat_messages (id, session_id, role, content, reasoning, status, created_at)
-	VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	INSERT INTO chat_messages (id, session_id, role, content, reasoning, status, created_at, progress)
+	VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
 	ON CONFLICT(id) DO UPDATE SET
 		content = excluded.content,
 		reasoning = excluded.reasoning,
+		progress = excluded.progress,
 		status = excluded.status;
 	`
-	_, err := s.db.Exec(query, m.ID, m.SessionID, m.Role, m.Content, m.Reasoning, m.Status)
+	_, err := s.db.Exec(query, m.ID, m.SessionID, m.Role, m.Content, m.Reasoning, m.Status, m.Progress)
 	if err == nil {
 		_, _ = s.db.Exec("UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", m.SessionID)
 	}
@@ -1620,6 +1590,26 @@ func (s *SQLiteStore) DeleteAPIKey(key string) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// RenameAPIKey updates only the display name of an existing API key.
+func (s *SQLiteStore) RenameAPIKey(key, name string) error {
+	if s == nil {
+		return errSQLiteUnavailable
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db == nil {
+		return errSQLiteUnavailable
+	}
+	res, err := s.db.Exec("UPDATE api_keys SET name = ? WHERE key = ?", name, key)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrAPIKeyNotFound
+	}
+	return nil
 }
 
 var ErrInvalidAccountBinding = errors.New("绑定账号不存在")

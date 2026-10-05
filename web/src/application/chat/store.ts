@@ -143,6 +143,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       role: 'assistant',
       content: '',
       reasoning: '',
+      progress: '',
       createdAt: new Date().toISOString(),
       status: 'loading',
     };
@@ -160,6 +161,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     let currentContent = '';
     let currentReasoning = '';
+    let currentProgress = '';
 
     await repo.sendMessageStream({
       sessionId: currentSessionId,
@@ -174,9 +176,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // 只取到 userMsg 为止，不含 assistantMsg 占位（它此刻还是空的）。
       history: [...session.messages],
       onUsage: (usage) => set({ lastUsage: usage }),
-      onChunk: (chunk, reasoningChunk) => {
+      onChunk: (chunk, reasoningChunk, progressChunk) => {
         if (chunk) currentContent += chunk;
         if (reasoningChunk) currentReasoning += reasoningChunk;
+        if (progressChunk) currentProgress += progressChunk;
+        if (!chunk && !reasoningChunk && !progressChunk) return;
 
         const liveSessions = get().sessions.map((s) => {
           if (s.id !== currentSessionId) return s;
@@ -186,6 +190,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
               ...m,
               content: currentContent,
               reasoning: currentReasoning,
+              progress: currentProgress,
               status: 'loading' as const,
             };
           });
@@ -202,6 +207,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
               ...m,
               content: currentContent,
               reasoning: currentReasoning,
+              progress: currentProgress,
               status: 'success' as const,
             };
           });
@@ -220,6 +226,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
               ...m,
               content: `${currentContent ? currentContent + '\n\n' : ''}[请求失败] ${err.message}`,
               reasoning: currentReasoning,
+              progress: currentProgress,
               status: 'error' as const,
             };
           });
