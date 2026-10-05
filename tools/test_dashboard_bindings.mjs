@@ -75,11 +75,14 @@ try {
   const request = await send;
   assert.equal(request.headers()['x-oaiprism-account'], 'b');
   await page.getByText('你好，这是一段流式回答。（完）', { exact: true }).waitFor();
+  await waitUntil(async () => await page.getByRole('combobox', { name: '调试账号' }).isEnabled());
   // The account can be disabled by an administrator after the selector loaded.
   // The web Chat must render the server's SSE error instead of a false success.
   await api('PUT', '/admin/accounts/b', { enabled: false });
+  const failedSend = page.waitForRequest((r) => r.url().endsWith('/v1/chat/completions') && r.method() === 'POST');
   await page.getByPlaceholder('输入调试指令，例如：生成一个鹈鹕骑自行车的 SVG，用 HTML 实现...').fill('disabled account smoke');
   await page.getByPlaceholder('输入调试指令，例如：生成一个鹈鹕骑自行车的 SVG，用 HTML 实现...').press('Enter');
+  assert.equal((await failedSend).headers()['x-oaiprism-account'], 'b');
   await page.getByText('[请求失败] 指定账号已停用或暂不可用: b', { exact: true }).waitFor();
   await api('PUT', '/admin/accounts/b', { enabled: true });
   await api('PUT', `/admin/apikeys/${encodeURIComponent(testKey.key)}/bindings`, { account_ids: ['b'] });
@@ -91,8 +94,25 @@ try {
   assert.equal(await page.getByText('Account A (a)', { exact: true }).count(), 0);
   assert.equal(await page.getByText('Account C (c)', { exact: true }).count(), 0);
   await page.keyboard.press('Escape');
+  await page.getByRole('menuitem', { name: '账号与计划池' }).click();
+  const accountRow = page.getByRole('row').filter({ has: page.getByRole('switch', { name: 'Account C 启用状态' }) });
+  await accountRow.getByRole('button').last().click();
+  await page.getByRole('button', { name: '确定删除', exact: true }).click();
+  await waitUntil(async () => !(await api('GET', '/admin/accounts')).accounts.some((a) => a.id === 'c'));
+  const reloadRequest = page.waitForResponse((r) => r.url().endsWith('/admin/reload') && r.request().method() === 'POST');
+  await page.getByRole('button', { name: /重载并刷新/ }).click();
+  assert.equal((await reloadRequest).status(), 200);
+  await page.reload();
+  await page.getByRole('menuitem', { name: '账号与计划池' }).click();
+  await page.getByRole('switch', { name: 'Account A 启用状态' }).waitFor();
+  assert.equal(await page.getByRole('switch', { name: 'Account C 启用状态' }).count(), 0);
+  assert.equal((await api('GET', '/admin/accounts')).accounts.some((a) => a.id === 'c'), false);
+  if (process.env.OAIPRISM_SCREENSHOT) await page.screenshot({ path: process.env.OAIPRISM_SCREENSHOT, fullPage: true });
   assert.deepEqual(errors, []);
-  console.log('PASS: account toggle, multi-account key creation/edit, web Chat selection, restricted options, request header, inference, SSE failure, reload persistence');
+  console.log('PASS: account toggle, multi-account key creation/edit, web Chat selection, restricted options, request header, inference, SSE failure, reload persistence, account deletion after reload');
+} catch (error) {
+  console.error('Browser page state:', await page.locator('body').innerText());
+  throw error;
 } finally {
   await browser.close();
 }

@@ -325,12 +325,12 @@ export const AccountsPage: React.FC = () => {
             />
           </Tooltip>
           <Popconfirm
-            title="确定物理删除此账号？"
-            description="将直接从 SQLite 数据库与运行池中永久删除，无需后端改配置！"
+            title="确定删除此账号？"
+            description="将移除该账号及凭据文件中的对应记录，重载后不会恢复。"
             onConfirm={async () => {
               try {
                 await deleteAccount(record.id);
-                message.success(`账号 [${record.name}] 已从 SQLite 物理删除并生效！`);
+                message.success(`账号 [${record.name}] 已删除`);
               } catch (err: any) {
                 message.error(`删除失败: ${err.message}`);
               }
@@ -419,7 +419,7 @@ export const AccountsPage: React.FC = () => {
             onClick={async () => {
               try {
                 await reloadPool();
-                message.success('账号池已从 SQLite 热重载并同步最新状态！');
+                message.success('凭据已重载，账号池已刷新');
               } catch (err: any) {
                 message.error(`重载失败: ${err.message}`);
               }

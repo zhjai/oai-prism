@@ -87,6 +87,10 @@ func (s *SQLiteStore) initSchema() error {
 		tags TEXT DEFAULT '',
 		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	);
+	CREATE TABLE IF NOT EXISTS deleted_accounts (
+		id TEXT PRIMARY KEY,
+		deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
 
 	CREATE TABLE IF NOT EXISTS request_logs (
 		id TEXT PRIMARY KEY,
@@ -272,6 +276,50 @@ func (s *SQLiteStore) Load() ([]config.AccountConfig, error) {
 
 // SaveAccount 插入或更新单账号 (Create or Update)。
 func (s *SQLiteStore) SaveAccount(a config.AccountConfig) error {
+	return s.saveAccount(a, true)
+}
+
+// SaveImportedAccount never restores an account deleted through the Dashboard.
+func (s *SQLiteStore) SaveImportedAccount(a config.AccountConfig) error {
+	return s.saveAccount(a, false)
+}
+
+// FilterDeletedAccounts excludes deleted static/file sources during startup.
+func (s *SQLiteStore) FilterDeletedAccounts(list []config.AccountConfig) ([]config.AccountConfig, error) {
+	if s == nil {
+		return nil, errSQLiteUnavailable
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db == nil {
+		return nil, errSQLiteUnavailable
+	}
+	rows, err := s.db.Query("SELECT id FROM deleted_accounts")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	deleted := make(map[string]bool)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		deleted[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	filtered := make([]config.AccountConfig, 0, len(list))
+	for _, a := range list {
+		if !deleted[a.ID] {
+			filtered = append(filtered, a)
+		}
+	}
+	return filtered, nil
+}
+
+func (s *SQLiteStore) saveAccount(a config.AccountConfig, explicit bool) error {
 	if s == nil {
 		return errSQLiteUnavailable
 	}
@@ -307,7 +355,8 @@ func (s *SQLiteStore) SaveAccount(a config.AccountConfig) error {
 
 	query := `
 	INSERT INTO accounts (id, name, plan, email, cookies, access_token, refresh_token, max_concurrency, tags, enabled, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP
+	WHERE ? OR NOT EXISTS (SELECT 1 FROM deleted_accounts WHERE id = ?)
 	ON CONFLICT(id) DO UPDATE SET
 		name = excluded.name,
 		plan = excluded.plan,
@@ -320,7 +369,12 @@ func (s *SQLiteStore) SaveAccount(a config.AccountConfig) error {
 		enabled = CASE WHEN ? THEN excluded.enabled ELSE accounts.enabled END,
 		updated_at = CURRENT_TIMESTAMP;
 	`
-	_, err := s.db.Exec(query,
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.Exec(query,
 		a.ID,
 		a.Name,
 		a.Plan,
@@ -331,12 +385,19 @@ func (s *SQLiteStore) SaveAccount(a config.AccountConfig) error {
 		a.MaxConcurrency,
 		tagsJSON,
 		a.IsEnabled(),
+		explicit,
+		a.ID,
 		a.Enabled != nil,
 	)
 	if err != nil {
 		return fmt.Errorf("保存账号 %s 至 SQLite 失败: %w", a.ID, err)
 	}
-	return nil
+	if explicit {
+		if _, err := tx.Exec("DELETE FROM deleted_accounts WHERE id = ?", a.ID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // DeleteAccount 从 SQLite 中物理删除账号 (Delete)。
@@ -366,6 +427,9 @@ func (s *SQLiteStore) DeleteAccount(id string) error {
 	affected, _ := res.RowsAffected()
 	if affected == 0 {
 		return fmt.Errorf("账号不存在: %s", id)
+	}
+	if _, err := tx.Exec("INSERT OR REPLACE INTO deleted_accounts (id) VALUES (?)", id); err != nil {
+		return err
 	}
 	// Keep account_restricted set even when the final binding is removed.
 	// An empty restricted key must never silently gain access to every account.
@@ -398,7 +462,7 @@ func (s *SQLiteStore) MigrateIfEmpty(existing []config.AccountConfig) error {
 		if a.ID == "" {
 			continue
 		}
-		if err := s.SaveAccount(a); err != nil {
+		if err := s.SaveImportedAccount(a); err != nil {
 			s.log.Warn("初始化迁移账号失败", "id", a.ID, "err", err)
 		}
 	}

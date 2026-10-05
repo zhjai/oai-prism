@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -42,8 +43,9 @@ type Server struct {
 	srv    *http.Server
 	gwPort string // 网关自身端口（OAuth 回调降级路由用）
 
-	keys   *dynamicKeys   // Dashboard 签发的 API Key（SQLite）
-	admins *adminSessions // /admin/login 签发的管理会话
+	keys      *dynamicKeys   // Dashboard 签发的 API Key（SQLite）
+	admins    *adminSessions // /admin/login 签发的管理会话
+	accountMu sync.Mutex     // Serialize account edits and pool rebuilds.
 }
 
 // New 组装并返回服务器。
@@ -83,10 +85,16 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		}
 	}
 
-	if len(fileAccounts) > 0 {
-		if err := pool.Build(mergeAccounts(cfg.Creds.Accounts, fileAccounts)); err != nil {
-			return nil, fmt.Errorf("构建账号池: %w", err)
+	initialAccounts := mergeAccounts(cfg.Creds.Accounts, fileAccounts)
+	if sqliteStore != nil {
+		initialAccounts, err = sqliteStore.FilterDeletedAccounts(initialAccounts)
+		if err != nil {
+			_ = sqliteStore.Close()
+			return nil, fmt.Errorf("读取账号删除记录: %w", err)
 		}
+	}
+	if err := pool.Build(initialAccounts); err != nil {
+		return nil, fmt.Errorf("构建账号池: %w", err)
 	}
 	if pool.Size() == 0 {
 		log.Warn("账号池为空：服务会正常启动，但所有推理请求都会失败。"+
@@ -407,13 +415,15 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 			writeAdminErr(w, http.StatusServiceUnavailable, "SQLite 账号存储不可用")
 			return
 		}
+		s.accountMu.Lock()
+		defer s.accountMu.Unlock()
 		for _, a := range batch {
 			if err := s.sqlite.SaveAccount(a); err != nil {
 				writeAdminErr(w, http.StatusInternalServerError, "保存至 SQLite 失败: "+err.Error())
 				return
 			}
 		}
-		if err := s.syncPoolFromSQLite(); err != nil {
+		if err := s.syncPoolFromSQLiteLocked(); err != nil {
 			writeAdminErr(w, http.StatusInternalServerError, "重建账号池失败: "+err.Error())
 			return
 		}
@@ -460,6 +470,8 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 			writeAdminErr(w, http.StatusServiceUnavailable, "SQLite 账号存储不可用")
 			return
 		}
+		s.accountMu.Lock()
+		defer s.accountMu.Unlock()
 		list, err := s.sqlite.Load()
 		if err != nil {
 			writeAdminErr(w, http.StatusInternalServerError, "读取 SQLite 失败: "+err.Error())
@@ -489,7 +501,7 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 			writeAdminErr(w, http.StatusInternalServerError, "更新 SQLite 失败: "+err.Error())
 			return
 		}
-		if err := s.syncPoolFromSQLite(); err != nil {
+		if err := s.syncPoolFromSQLiteLocked(); err != nil {
 			writeAdminErr(w, http.StatusInternalServerError, "重建账号池失败: "+err.Error())
 			return
 		}
@@ -501,7 +513,7 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 		})
 	})
 
-	// DELETE /admin/accounts/{id}: 从 SQLite 中物理删除账号并即时剔除
+	// DELETE /admin/accounts/{id}: 删除凭据源和 SQLite 账号并即时剔除
 	mux.HandleFunc("DELETE /admin/accounts/{id}", func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
 		if id == "" {
@@ -509,13 +521,37 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 			return
 		}
 
-		if s.sqlite != nil {
-			if err := s.sqlite.DeleteAccount(id); err != nil {
-				writeAdminErr(w, http.StatusNotFound, err.Error())
-				return
-			}
-			s.keys.Invalidate()
-			_ = s.syncPoolFromSQLite()
+		if s.sqlite == nil {
+			writeAdminErr(w, http.StatusServiceUnavailable, "SQLite 账号存储不可用")
+			return
+		}
+		s.accountMu.Lock()
+		defer s.accountMu.Unlock()
+		stored, err := s.sqlite.Load()
+		if err != nil {
+			writeAdminErr(w, http.StatusInternalServerError, "读取 SQLite 失败: "+err.Error())
+			return
+		}
+		found := false
+		for _, a := range stored {
+			found = found || a.ID == id
+		}
+		if !found {
+			writeAdminErr(w, http.StatusNotFound, "账号不存在: "+id)
+			return
+		}
+		if err := s.store.DeleteAccount(id); err != nil {
+			writeAdminErr(w, http.StatusInternalServerError, "删除凭据文件中的账号失败: "+err.Error())
+			return
+		}
+		if err := s.sqlite.DeleteAccount(id); err != nil {
+			writeAdminErr(w, http.StatusInternalServerError, "删除 SQLite 账号失败: "+err.Error())
+			return
+		}
+		s.keys.Invalidate()
+		if err := s.syncPoolFromSQLiteLocked(); err != nil {
+			writeAdminErr(w, http.StatusInternalServerError, "重建账号池失败: "+err.Error())
+			return
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -1156,6 +1192,8 @@ func (s *Server) Close() error {
 
 // Import file credentials without replacing settings already edited in the Dashboard.
 func (s *Server) syncPoolFromFile(list []config.AccountConfig) error {
+	s.accountMu.Lock()
+	defer s.accountMu.Unlock()
 	stored, err := s.sqlite.Load()
 	if err != nil {
 		return err
@@ -1173,15 +1211,21 @@ func (s *Server) syncPoolFromFile(list []config.AccountConfig) error {
 			a.Enabled = current.Enabled
 			a.Tags = current.Tags
 		}
-		if err := s.sqlite.SaveAccount(a); err != nil {
+		if err := s.sqlite.SaveImportedAccount(a); err != nil {
 			return err
 		}
 	}
-	return s.syncPoolFromSQLite()
+	return s.syncPoolFromSQLiteLocked()
 }
 
 // syncPoolFromSQLite 从 SQLite 读取全量账号并重新热加载至账号池。
 func (s *Server) syncPoolFromSQLite() error {
+	s.accountMu.Lock()
+	defer s.accountMu.Unlock()
+	return s.syncPoolFromSQLiteLocked()
+}
+
+func (s *Server) syncPoolFromSQLiteLocked() error {
 	if s.sqlite == nil {
 		return nil
 	}

@@ -115,12 +115,14 @@ func TestStore_PersistAndReload(t *testing.T) {
 	s := NewStore(path, nopLog())
 
 	exp := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	disabled := false
 	in := []config.AccountConfig{{
 		ID:          "main",
 		Name:        "主账号",
 		Cookies:     "__Secure-next-auth.session-token=abc",
 		AccessToken: "tok",
 		ExpiresAt:   &exp,
+		Enabled:     &disabled,
 	}}
 	if err := s.Persist(in); err != nil {
 		t.Fatal(err)
@@ -145,7 +147,7 @@ func TestStore_PersistAndReload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out) != 1 || out[0].ID != "main" || out[0].AccessToken != "tok" {
+	if len(out) != 1 || out[0].ID != "main" || out[0].AccessToken != "tok" || out[0].IsEnabled() {
 		t.Fatalf("回读不一致: %+v", out)
 	}
 

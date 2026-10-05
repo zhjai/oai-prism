@@ -59,6 +59,12 @@ func (s *Store) Exists() bool {
 // Load 读取凭据文件。文件不存在时返回 (nil, nil)——
 // 这是刻意设计：服务应当能先起来，凭据后补。
 func (s *Store) Load() ([]config.AccountConfig, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.loadLocked()
+}
+
+func (s *Store) loadLocked() ([]config.AccountConfig, error) {
 	if s.path == "" {
 		return nil, nil
 	}
@@ -79,12 +85,10 @@ func (s *Store) Load() ([]config.AccountConfig, error) {
 		return nil, fmt.Errorf("解析 %s: %w", s.path, err)
 	}
 
-	s.mu.Lock()
 	s.lastMod = fi.ModTime()
 	s.lastSz = fi.Size()
 	s.curr = list
 	s.loaded = true
-	s.mu.Unlock()
 
 	return list, nil
 }
@@ -146,6 +150,8 @@ func (s *Store) Watch(ctx context.Context, interval time.Duration, onChange func
 
 // Persist 把账号列表原子写回磁盘（用于刷新后的 token 回写）。
 func (s *Store) Persist(list []config.AccountConfig) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.path == "" {
 		return fmt.Errorf("未配置 creds.file")
 	}
@@ -155,6 +161,7 @@ func (s *Store) Persist(list []config.AccountConfig) error {
 		fa := fileAccount{
 			ID:             a.ID,
 			Name:           a.Name,
+			Enabled:        a.Enabled,
 			Cookies:        a.Cookies,
 			CookieMap:      a.CookieMap,
 			SessionToken:   a.SessionToken,
@@ -183,30 +190,129 @@ func (s *Store) Persist(list []config.AccountConfig) error {
 		return err
 	}
 
-	dir := filepath.Dir(s.path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	tmp := s.path + ".tmp"
-	// 权限 0600：这里存的是可以直接登录你账号的凭据。
-	if err := os.WriteFile(tmp, buf, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, s.path); err != nil {
-		_ = os.Remove(tmp)
+	if err := s.writeLocked(buf); err != nil {
 		return err
 	}
 
 	// 写回后同步内部状态，避免 Watcher 把自己写的当成外部变更再刷一遍。
 	if fi, err := os.Stat(s.path); err == nil {
-		s.mu.Lock()
 		s.lastMod = fi.ModTime()
 		s.lastSz = fi.Size()
 		s.curr = append([]config.AccountConfig(nil), list...)
 		s.loaded = true
-		s.mu.Unlock()
 	}
 	return nil
+}
+
+// DeleteAccount edits the source document, preserving other credentials and metadata.
+func (s *Store) DeleteAccount(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.path == "" {
+		return nil
+	}
+	raw, err := os.ReadFile(s.path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	list, err := ParseAccounts(raw)
+	if err != nil {
+		return err
+	}
+	found := false
+	for _, a := range list {
+		found = found || a.ID == id
+	}
+	if !found {
+		return nil
+	}
+	var doc map[string]json.RawMessage
+	var entries []json.RawMessage
+	key := ""
+	if strings.HasPrefix(strings.TrimSpace(string(raw)), "{") {
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			return err
+		}
+		for k := range doc {
+			if strings.EqualFold(k, "accounts") {
+				key = k
+				break
+			}
+		}
+		raw = doc[key]
+	}
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		return err
+	}
+	kept := make([]json.RawMessage, 0, len(entries))
+	for i, entry := range entries {
+		if list[i].ID == id {
+			continue
+		}
+		m, err := decodeLoose(entry)
+		if err != nil {
+			return err
+		}
+		// Pin generated IDs before removing an entry changes its array index.
+		if str(m, "id") == "" {
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(entry, &fields); err != nil {
+				return err
+			}
+			if fields == nil {
+				fields = make(map[string]json.RawMessage)
+			}
+			fields["id"], _ = json.Marshal(list[i].ID)
+			entry, err = json.Marshal(fields)
+			if err != nil {
+				return err
+			}
+		}
+		kept = append(kept, entry)
+	}
+	buf, err := json.MarshalIndent(kept, "", "  ")
+	if err != nil {
+		return err
+	}
+	if doc != nil {
+		doc[key] = buf
+		buf, err = json.MarshalIndent(doc, "", "  ")
+		if err != nil {
+			return err
+		}
+	}
+	if err := s.writeLocked(buf); err != nil {
+		return err
+	}
+	_, err = s.loadLocked()
+	return err
+}
+
+func (s *Store) writeLocked(buf []byte) error {
+	dir := filepath.Dir(s.path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, ".accounts-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write(buf); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), s.path)
 }
 
 // ---------------------------- 文件格式 ----------------------------
