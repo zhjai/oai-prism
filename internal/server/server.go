@@ -24,6 +24,7 @@ import (
 	"github.com/oai-prism/oaiprism/internal/config"
 	"github.com/oai-prism/oaiprism/internal/creds"
 	"github.com/oai-prism/oaiprism/internal/facade"
+	"github.com/oai-prism/oaiprism/internal/httpc"
 	"github.com/oai-prism/oaiprism/internal/metrics"
 	"github.com/oai-prism/oaiprism/internal/middleware"
 	"github.com/oai-prism/oaiprism/internal/prism"
@@ -33,15 +34,17 @@ import (
 
 // Server 是完整运行实例。
 type Server struct {
-	cfg    *config.Config
-	log    *slog.Logger
-	app    *metrics.App
-	pool   *account.Pool
-	store  *account.Store
-	sqlite *account.SQLiteStore
-	rec    *capture.Recorder
-	srv    *http.Server
-	gwPort string // 网关自身端口（OAuth 回调降级路由用）
+	cfg       *config.Config
+	log       *slog.Logger
+	app       *metrics.App
+	pool      *account.Pool
+	store     *account.Store
+	sqlite    *account.SQLiteStore
+	rec       *capture.Recorder
+	srv       *http.Server
+	gwPort    string // 网关自身端口（OAuth 回调降级路由用）
+	runner    *facade.Runner
+	closeOnce sync.Once
 
 	keys      *dynamicKeys   // Dashboard 签发的 API Key（SQLite）
 	admins    *adminSessions // /admin/login 签发的管理会话
@@ -77,17 +80,18 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		log.Error("初始化 SQLite 账号存储失败，退化为仅文件模式",
 			"path", dbPath, "err", sqliteErr)
 	} else {
-		// 自动迁移已有账号至 SQLite，实现开箱即用无缝接管
 		mergedInit := mergeAccounts(cfg.Creds.Accounts, fileAccounts)
-		_ = sqliteStore.MigrateIfEmpty(mergedInit)
-		if dbAccounts, err := sqliteStore.Load(); err == nil && len(dbAccounts) > 0 {
-			fileAccounts = dbAccounts
+		for _, a := range mergedInit {
+			if err := sqliteStore.SaveImportedAccount(a); err != nil {
+				_ = sqliteStore.Close()
+				return nil, fmt.Errorf("同步账号来源至 SQLite: %w", err)
+			}
 		}
 	}
 
 	initialAccounts := mergeAccounts(cfg.Creds.Accounts, fileAccounts)
 	if sqliteStore != nil {
-		initialAccounts, err = sqliteStore.FilterDeletedAccounts(initialAccounts)
+		initialAccounts, err = sqliteStore.Load()
 		if err != nil {
 			_ = sqliteStore.Close()
 			return nil, fmt.Errorf("读取账号删除记录: %w", err)
@@ -130,6 +134,9 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 	client.SetMetrics(app)
 
 	// 4) 门面与通道。
+	if sqliteStore != nil {
+		pool.SetCredentialPersister(sqliteStore.UpdateCredential)
+	}
 	runner := facade.NewRunner(cfg, log, pool, client, app)
 	if sqliteErr == nil {
 		// 原生续接的会话绑定落盘：网关重启后客户端会话接回原来的上游会话（见 facade/native_store.go）。
@@ -147,6 +154,7 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		sqlite: sqliteStore,
 		rec:    rec,
 		admins: newAdminSessions(),
+		runner: runner,
 	}
 	if sqliteStore != nil {
 		s.keys = newDynamicKeys(sqliteStore)
@@ -174,7 +182,7 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 			DynamicScopes: s.keys.GetScopes,
 			AdminToken:    s.admins.Valid,
 			ExemptPaths: []string{
-				cfg.Metrics.Health, cfg.Metrics.Ready, cfg.Metrics.Path,
+				cfg.Metrics.Health, cfg.Metrics.Ready,
 				// 登录本身与 OAuth 浏览器回调（由 state 保护）不能要求已登录。
 				"/admin/login", "/admin/oauth/callback",
 			},
@@ -183,6 +191,14 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 			CORSOrigin:     cfg.Server.CORSOrigin,
 			App:            app,
 		}),
+		func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Body != nil {
+					r.Body = http.MaxBytesReader(w, r.Body, cfg.Server.MaxBodyBytes)
+				}
+				next.ServeHTTP(w, r)
+			})
+		},
 	)
 
 	// 网关自身端口：OAuth 导入的回调降级路由（/admin/oauth/callback）需要它
@@ -247,6 +263,21 @@ func (s *Server) warnInsecureDefaults() {
 	if s.cfg.RawProxy.PassthroughAuth {
 		s.log.Warn("raw_proxy.passthrough_auth 尚未实现，该配置不生效：原样反代始终使用账号池凭据")
 	}
+	if s.cfg.Creds.Mode == "passthrough" {
+		s.log.Warn("creds.mode=passthrough 尚未实现；推理仍需要账号池凭据")
+	}
+	if s.cfg.Server.BasePath != "" {
+		s.log.Warn("server.base_path 尚未实现，该配置不生效")
+	}
+	if s.cfg.Creds.PersistRefresh {
+		s.log.Warn("creds.persist_refresh 的 JSON 写回尚未实现；刷新凭据已自动保存至 SQLite")
+	}
+	if s.cfg.Facade.ExposeRawMetadata {
+		s.log.Warn("facade.expose_raw_metadata 尚未实现，该配置不生效")
+	}
+	if s.cfg.Facade.SystemToInstructions {
+		s.log.Warn("facade.system_to_instructions 尚未实现，系统消息按现有请求转换规则处理")
+	}
 	if s.cfg.Facade.LocalWorkspaceWrite {
 		s.log.Warn("facade.local_workspace_write 已开启：本机请求可经 X-Local-Workspace 让网关直接写本机目录")
 	}
@@ -261,6 +292,10 @@ func mergeAccounts(base, override []config.AccountConfig) []config.AccountConfig
 	out := make([]config.AccountConfig, len(base))
 	copy(out, base)
 	for i, a := range out {
+		if a.ID == "" {
+			a.ID = fmt.Sprintf("acct-%d", i+1)
+			out[i].ID = a.ID
+		}
 		index[a.ID] = i
 	}
 	for _, a := range override {
@@ -347,6 +382,15 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 			// 而不是等到线上请求全 502 才发现。
 			body["status"] = "no_credentials"
 			code = http.StatusServiceUnavailable
+		} else if healthy == 0 {
+			busy := false
+			for _, a := range s.pool.Accounts() {
+				busy = busy || a.Busy(now)
+			}
+			if !busy {
+				body["status"] = "no_available_accounts"
+				code = http.StatusServiceUnavailable
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(code)
@@ -386,6 +430,7 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 	})
 
 	// POST /admin/accounts: 创建/批量导入账号并持久化至 SQLite
+	mux.HandleFunc("POST /admin/accounts/import", s.handleAccountImport)
 	mux.HandleFunc("POST /admin/accounts", func(w http.ResponseWriter, r *http.Request) {
 		var body json.RawMessage
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -398,16 +443,26 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 			rawAccounts = []json.RawMessage{body}
 		}
 		batch := make([]config.AccountConfig, 0, len(rawAccounts))
+		if len(rawAccounts) == 0 || len(rawAccounts) > 100 {
+			writeAdminErr(w, http.StatusBadRequest, "每次需导入 1 至 100 个账号")
+			return
+		}
 		for _, raw := range rawAccounts {
 			a := config.AccountConfig{MaxConcurrency: 2}
 			if err := json.Unmarshal(raw, &a); err != nil {
 				writeAdminErr(w, http.StatusBadRequest, "请求体需为账号对象或账号数组: "+err.Error())
 				return
 			}
-			if a.MaxConcurrency < 0 {
-				writeAdminErr(w, http.StatusBadRequest, "最大并发槽位不能为负数")
+			if a.MaxConcurrency < 0 || a.RatePerSecond < 0 || a.RateBurst < 0 || a.Weight < 0 || strings.TrimSpace(string(raw)) == "null" {
+				writeAdminErr(w, http.StatusBadRequest, "账号或调度参数无效")
 				return
 			}
+			client, err := httpc.New(s.cfg.Upstream, httpc.Options{Proxy: a.Proxy})
+			if err != nil {
+				writeAdminErr(w, http.StatusBadRequest, "账号代理地址无效")
+				return
+			}
+			client.CloseIdle()
 			batch = append(batch, a)
 		}
 
@@ -417,11 +472,9 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 		}
 		s.accountMu.Lock()
 		defer s.accountMu.Unlock()
-		for _, a := range batch {
-			if err := s.sqlite.SaveAccount(a); err != nil {
-				writeAdminErr(w, http.StatusInternalServerError, "保存至 SQLite 失败: "+err.Error())
-				return
-			}
+		if err := s.sqlite.SaveAccounts(batch); err != nil {
+			writeAdminErr(w, http.StatusInternalServerError, "保存至 SQLite 失败: "+err.Error())
+			return
 		}
 		if err := s.syncPoolFromSQLiteLocked(); err != nil {
 			writeAdminErr(w, http.StatusInternalServerError, "重建账号池失败: "+err.Error())
@@ -472,37 +525,45 @@ func (s *Server) registerOps(mux *http.ServeMux, runner *facade.Runner) {
 		}
 		s.accountMu.Lock()
 		defer s.accountMu.Unlock()
-		list, err := s.sqlite.Load()
-		if err != nil {
-			writeAdminErr(w, http.StatusInternalServerError, "读取 SQLite 失败: "+err.Error())
-			return
-		}
-		var update config.AccountConfig
-		for _, a := range list {
-			if a.ID == id {
-				update = a
-				break
+		status := http.StatusInternalServerError
+		// Keep the read/merge/write operation serialized with refresh commits.
+		if err := s.pool.Reload(func() ([]config.AccountConfig, error) {
+			list, err := s.sqlite.Load()
+			if err != nil {
+				return nil, err
 			}
-		}
-		if update.ID == "" {
-			writeAdminErr(w, http.StatusNotFound, "账号不存在: "+id)
-			return
-		}
-		if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
-			writeAdminErr(w, http.StatusBadRequest, "解析修改数据失败: "+err.Error())
-			return
-		}
-		update.ID = id
-		if update.MaxConcurrency < 0 {
-			writeAdminErr(w, http.StatusBadRequest, "最大并发槽位不能为负数")
-			return
-		}
-		if err := s.sqlite.SaveAccount(update); err != nil {
-			writeAdminErr(w, http.StatusInternalServerError, "更新 SQLite 失败: "+err.Error())
-			return
-		}
-		if err := s.syncPoolFromSQLiteLocked(); err != nil {
-			writeAdminErr(w, http.StatusInternalServerError, "重建账号池失败: "+err.Error())
+			var update config.AccountConfig
+			for _, a := range list {
+				if a.ID == id {
+					update = a
+					break
+				}
+			}
+			if update.ID == "" {
+				status = http.StatusNotFound
+				return nil, fmt.Errorf("账号不存在")
+			}
+			if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+				status = http.StatusBadRequest
+				return nil, fmt.Errorf("修改数据不是有效的账号 JSON")
+			}
+			update.ID = id
+			if update.MaxConcurrency < 0 || update.RatePerSecond < 0 || update.RateBurst < 0 || update.Weight < 0 {
+				status = http.StatusBadRequest
+				return nil, fmt.Errorf("并发数、速率、突发量和权重不能为负数")
+			}
+			client, err := httpc.New(s.cfg.Upstream, httpc.Options{Proxy: update.Proxy})
+			if err != nil {
+				status = http.StatusBadRequest
+				return nil, fmt.Errorf("账号代理地址无效")
+			}
+			client.CloseIdle()
+			if err := s.sqlite.SaveAccount(update); err != nil {
+				return nil, err
+			}
+			return s.sqlite.Load()
+		}); err != nil {
+			writeAdminErr(w, status, "更新账号失败: "+err.Error())
 			return
 		}
 
@@ -1030,8 +1091,8 @@ func (s *Server) requestAuditMiddleware(next http.Handler) http.Handler {
 		duration := time.Since(start).Milliseconds()
 		// 实际路由到的账号由 facade 记进审计上下文；不读请求头 —— 那是客户端可控输入。
 		accountID := middleware.LogAccount(r.Context())
-		if hModel := r.Header.Get("X-Oaiprism-Model"); hModel != "" {
-			model = hModel
+		if effectiveModel := middleware.LogModel(r.Context()); effectiveModel != "" {
+			model = effectiveModel
 		}
 
 		item := account.RequestLogItem{
@@ -1053,17 +1114,9 @@ func (s *Server) requestAuditMiddleware(next http.Handler) http.Handler {
 			item.ErrorMessage = strings.Join(errs, " | ")
 		}
 
-		go func() {
-			// s.sqlite 可能是 nil（初始化失败时仅告警不阻断）。
-			// 这里必须判空：nil 接收者会让方法内解引用崩掉整个进程，
-			// 而且是在后台 goroutine 里 —— 一个请求日志就能让服务下线。
-			// （2026-10-03 CI 在 Linux 上实测踩中；SQLiteStore 内部
-			// 也有 ready() 防御，这里是第一道闸。）
-			if s.sqlite == nil {
-				return
-			}
-			_ = s.sqlite.RecordRequestLog(item)
-		}()
+		if err := s.sqlite.RecordRequestLog(item); err != nil {
+			s.log.Warn("请求日志保存失败", "err", err)
+		}
 	})
 }
 
@@ -1071,6 +1124,7 @@ var startTime = time.Now()
 
 // Run 启动服务并阻塞直到 ctx 取消。
 func (s *Server) Run(ctx context.Context) error {
+	defer s.Close()
 	// 分词表后台预热：首次构建约需数百毫秒，不让第一笔请求承担。
 	tokens.Warmup()
 
@@ -1079,6 +1133,9 @@ func (s *Server) Run(ctx context.Context) error {
 	defer bgCancel()
 
 	s.pool.StartBackground(bgCtx)
+	if s.sqlite != nil && s.cfg.RequestLogs.MaxAge > 0 {
+		go s.pruneRequestLogs(bgCtx)
+	}
 	if s.cfg.Creds.Mode == "file" || s.cfg.Creds.Mode == "hybrid" {
 		go s.store.Watch(bgCtx, s.cfg.Creds.ReloadInterval, func(list []config.AccountConfig) {
 			if s.sqlite != nil {
@@ -1146,6 +1203,25 @@ func (s *Server) Run(ctx context.Context) error {
 
 const warmConnections = 4
 
+func (s *Server) pruneRequestLogs(ctx context.Context) {
+	interval := s.cfg.RequestLogs.PruneInterval
+	if interval <= 0 {
+		interval = time.Hour
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		if err := s.sqlite.PruneRequestLogs(time.Now().Add(-s.cfg.RequestLogs.MaxAge)); err != nil {
+			s.log.Warn("清理过期请求日志失败", "err", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 // listen 创建监听，并在 socket 层做一次缓冲调优。
 func (s *Server) listen() (net.Listener, error) {
 	lc := net.ListenConfig{}
@@ -1181,36 +1257,32 @@ func (s *Server) Metrics() *metrics.App { return s.app }
 
 // Close 释放服务占用的所有资源（包含 SQLite 句柄）。
 func (s *Server) Close() error {
-	if s.sqlite != nil {
-		_ = s.sqlite.Close()
-	}
-	if s.srv != nil {
-		return s.srv.Close()
-	}
-	return nil
+	var err error
+	s.closeOnce.Do(func() {
+		if s.srv != nil {
+			err = s.srv.Close()
+		}
+		if s.runner != nil {
+			s.runner.Close()
+		}
+		if s.rec != nil {
+			s.rec.Close()
+		}
+		if s.pool != nil {
+			s.pool.Close()
+		}
+		if s.sqlite != nil {
+			_ = s.sqlite.Close()
+		}
+	})
+	return err
 }
 
 // Import file credentials without replacing settings already edited in the Dashboard.
 func (s *Server) syncPoolFromFile(list []config.AccountConfig) error {
 	s.accountMu.Lock()
 	defer s.accountMu.Unlock()
-	stored, err := s.sqlite.Load()
-	if err != nil {
-		return err
-	}
-	byID := make(map[string]config.AccountConfig, len(stored))
-	for _, a := range stored {
-		byID[a.ID] = a
-	}
 	for _, a := range list {
-		if current, ok := byID[a.ID]; ok {
-			a.Name = current.Name
-			a.Email = current.Email
-			a.Plan = current.Plan
-			a.MaxConcurrency = current.MaxConcurrency
-			a.Enabled = current.Enabled
-			a.Tags = current.Tags
-		}
 		if err := s.sqlite.SaveImportedAccount(a); err != nil {
 			return err
 		}
@@ -1229,12 +1301,7 @@ func (s *Server) syncPoolFromSQLiteLocked() error {
 	if s.sqlite == nil {
 		return nil
 	}
-	dbAccounts, err := s.sqlite.Load()
-	if err != nil {
-		s.log.Error("从 SQLite 读取账号失败", "err", err)
-		return err
-	}
-	if err := s.pool.Build(dbAccounts); err != nil {
+	if err := s.pool.Reload(s.sqlite.Load); err != nil {
 		s.log.Error("重构账号池失败", "err", err)
 		return err
 	}

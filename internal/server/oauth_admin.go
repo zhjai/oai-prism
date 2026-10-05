@@ -23,12 +23,14 @@ package server
 // 刷新时逐账号使用，避免全局混用。
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net"
 	"net/http"
@@ -38,13 +40,15 @@ import (
 	"time"
 
 	"github.com/oai-prism/oaiprism/internal/config"
+	"github.com/oai-prism/oaiprism/internal/creds"
 )
 
 const (
-	oauthAuthorizeURL = "https://auth.openai.com/oauth/authorize"
-	oauthTokenURL     = "https://auth.openai.com/oauth/token"
-	oauthScope        = "openid profile email offline_access"
-	oauthSessionTTL   = 30 * time.Minute
+	oauthAuthorizeURL    = "https://auth.openai.com/oauth/authorize"
+	oauthTokenURL        = "https://auth.openai.com/oauth/token"
+	oauthScope           = "openid profile email offline_access"
+	oauthSessionTTL      = 30 * time.Minute
+	oauthBrowserClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
 )
 
 // oauthSession 一次授权流程的全部状态。
@@ -56,9 +60,10 @@ type oauthSession struct {
 	ClientID     string
 	CreatedAt    time.Time
 
-	done    bool   // 已拿到 code 并完成（或失败）
-	account string // 成功时：入库的账号 ID
-	errMsg  string // 失败时：错误描述
+	exchanging bool
+	done       bool   // 已拿到 code 并完成（或失败）
+	account    string // 成功时：入库的账号 ID
+	errMsg     string // 失败时：错误描述
 }
 
 // oauthSessionStore 管理进行中的授权会话（内存态，进程生命周期一致）。
@@ -79,15 +84,14 @@ func (s *oauthSessionStore) put(sess *oauthSession) {
 	defer s.mu.Unlock()
 	for k, old := range s.byState {
 		expired := time.Since(old.CreatedAt) > oauthSessionTTL
-		if expired || old.ClientID == sess.ClientID {
-			// 过期清理；同 client 只保留最新一个 pending —— 单活跃会话模式下
-			// 回调不会串到旧会话，新会话直接覆盖旧的。
+		if expired {
 			delete(s.byState, k)
 			delete(s.byID, old.ID)
 		}
 	}
-	s.byState[sess.State] = sess
-	s.byID[sess.ID] = sess
+	copy := *sess
+	s.byState[sess.State] = &copy
+	s.byID[sess.ID] = &copy
 }
 
 func (s *oauthSessionStore) getByState(state string) *oauthSession {
@@ -97,7 +101,8 @@ func (s *oauthSessionStore) getByState(state string) *oauthSession {
 	if !ok || time.Since(sess.CreatedAt) > oauthSessionTTL {
 		return nil
 	}
-	return sess
+	copy := *sess
+	return &copy
 }
 
 func (s *oauthSessionStore) getByID(id string) *oauthSession {
@@ -107,21 +112,46 @@ func (s *oauthSessionStore) getByID(id string) *oauthSession {
 	if !ok || time.Since(sess.CreatedAt) > oauthSessionTTL {
 		return nil
 	}
-	return sess
+	copy := *sess
+	return &copy
 }
 
-func (s *oauthSessionStore) remove(sess *oauthSession) {
+func (s *oauthSessionStore) claim(sess *oauthSession) (*oauthSession, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.byState, sess.State)
-	delete(s.byID, sess.ID)
+	if sess == nil {
+		return nil, fmt.Errorf("会话不存在或已过期")
+	}
+	current := s.byID[sess.ID]
+	if current == nil || current.State != sess.State || time.Since(current.CreatedAt) > oauthSessionTTL {
+		return nil, fmt.Errorf("会话不存在或已过期")
+	}
+	if current.exchanging || current.done {
+		return nil, fmt.Errorf("授权会话已提交，请查看导入状态")
+	}
+	current.exchanging = true
+	copy := *current
+	return &copy, nil
+}
+
+func (s *oauthSessionStore) finish(sess *oauthSession, accountID string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current := s.byID[sess.ID]
+	if current == nil || current.State != sess.State || current.done {
+		return
+	}
+	current.done, current.exchanging, current.account = true, false, accountID
+	if err != nil {
+		current.errMsg = err.Error()
+	}
 }
 
 // ---- PKCE（OpenAI 特有：verifier 用 hex 编码，challenge 走标准 S256）----
 
 func oauthGeneratePKCE() (verifier, challenge string, err error) {
 	raw := make([]byte, 64)
-	if _, err = rand.Read(raw); err != nil {
+	if _, err = io.ReadFull(rand.Reader, raw); err != nil {
 		return "", "", err
 	}
 	verifier = hex.EncodeToString(raw)
@@ -130,10 +160,12 @@ func oauthGeneratePKCE() (verifier, challenge string, err error) {
 	return verifier, challenge, nil
 }
 
-func oauthRandomHex(n int) string {
+func oauthRandomHex(n int) (string, error) {
 	b := make([]byte, n)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
+	if _, err := io.ReadFull(rand.Reader, b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 // oauthBuildAuthorizeURL 组装官方授权页地址。
@@ -154,7 +186,14 @@ func oauthBuildAuthorizeURL(clientID, redirectURI, state, challenge string) stri
 }
 
 // oauthExchange 用 code 换 token（JSON 请求，与 refresh 流程同一端点）。
-func oauthExchangeToken(clientID, code, codeVerifier, redirectURI string) (*credsOAuthToken, error) {
+func (s *Server) oauthExchangeToken(ctx context.Context, clientID, code, codeVerifier, redirectURI string) (*credsOAuthToken, error) {
+	if s.pool == nil || s.pool.Client() == nil || s.pool.Client().HTTP == nil {
+		return nil, fmt.Errorf("OAuth HTTP client unavailable")
+	}
+	tokenURL := oauthTokenURL
+	if s.cfg != nil && strings.TrimSpace(s.cfg.Creds.OAuthTokenURL) != "" {
+		tokenURL = strings.TrimSpace(s.cfg.Creds.OAuthTokenURL)
+	}
 	payload := map[string]string{
 		"grant_type":    "authorization_code",
 		"client_id":     clientID,
@@ -163,36 +202,42 @@ func oauthExchangeToken(clientID, code, codeVerifier, redirectURI string) (*cred
 		"code_verifier": codeVerifier,
 	}
 	buf, _ := json.Marshal(payload)
-	req, err := http.NewRequest(http.MethodPost, oauthTokenURL, strings.NewReader(string(buf)))
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(string(buf)))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("token request configuration invalid")
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := s.pool.Client().HTTP.Do(req)
 	if err != nil {
-		return nil, err
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("token request interrupted: %w", ctx.Err())
+		}
+		return nil, fmt.Errorf("token request failed")
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("token endpoint returned HTTP %d", resp.StatusCode)
+	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("token response read failed")
 	}
 	var out struct {
-		AccessToken      string `json:"access_token"`
-		RefreshToken     string `json:"refresh_token"`
-		IDToken          string `json:"id_token"`
-		ExpiresIn        int64  `json:"expires_in"`
-		Error            string `json:"error"`
-		ErrorDescription string `json:"error_description"`
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		IDToken      string `json:"id_token"`
+		ExpiresIn    int64  `json:"expires_in"`
+		Error        string `json:"error"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
-		return nil, fmt.Errorf("token 响应解析失败: %w", err)
+		return nil, fmt.Errorf("token 响应解析失败")
 	}
 	if out.Error != "" {
-		return nil, fmt.Errorf("上游拒绝: %s (%s)", out.Error, out.ErrorDescription)
+		return nil, fmt.Errorf("token endpoint rejected authorization")
 	}
 	if out.AccessToken == "" {
 		return nil, fmt.Errorf("token 响应缺少 access_token")
@@ -211,23 +256,19 @@ type credsOAuthToken struct {
 	ExpiresIn    int64
 }
 
-// oauthEmailFromIDToken 从 id_token（JWT 第二段）里拿 email，拿不到就返回空。
-func oauthEmailFromIDToken(idToken string) string {
-	parts := strings.Split(idToken, ".")
-	if len(parts) < 2 {
-		return ""
+func oauthAuthorizeClientID(requested, configured, redirectURI string) string {
+	if requested = strings.TrimSpace(requested); requested != "" {
+		return requested
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return ""
+	configured = strings.TrimSpace(configured)
+	if configured != "" && configured != config.DefaultOAuthClientID {
+		return configured
 	}
-	var claims struct {
-		Email string `json:"email"`
+	u, err := url.Parse(redirectURI)
+	if err == nil && (strings.EqualFold(u.Hostname(), "localhost") || net.ParseIP(u.Hostname()).IsLoopback()) {
+		return oauthBrowserClientID
 	}
-	if json.Unmarshal(raw, &claims) != nil {
-		return ""
-	}
-	return claims.Email
+	return config.DefaultOAuthClientID
 }
 
 // ---- 单例回调监听器：按 state 反查会话 ----
@@ -288,16 +329,21 @@ func (s *Server) handleOAuthBegin(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body)
 
-	clientID := strings.TrimSpace(body.ClientID)
-	if clientID == "" {
-		// 凭据配置的 oauth_client_id 是唯一真相源（与 refresh 流程同 client，
-		// 换出的 token 体系与存量账号一致）
-		clientID = s.cfg.Creds.OAuthClientID
+	verifier, challenge, err := oauthGeneratePKCE()
+	if err != nil {
+		writeAdminErr(w, http.StatusInternalServerError, "生成 PKCE 失败")
+		return
 	}
-	if clientID == "" {
-		clientID = config.DefaultOAuthClientID
+	state, err := oauthRandomHex(16)
+	if err != nil {
+		writeAdminErr(w, http.StatusInternalServerError, "生成 OAuth state 失败")
+		return
 	}
-
+	id, err := oauthRandomHex(8)
+	if err != nil {
+		writeAdminErr(w, http.StatusInternalServerError, "生成 OAuth session ID 失败")
+		return
+	}
 	// 本地回调监听器（单例）；端口被占则降级为网关自身的回调路由。
 	redirectURI, err := s.ensureOAuthCallbackListener()
 	if err != nil {
@@ -306,15 +352,13 @@ func (s *Server) handleOAuthBegin(w http.ResponseWriter, r *http.Request) {
 	if u := strings.TrimSpace(body.RedirectURI); u != "" {
 		redirectURI = u
 	}
-
-	verifier, challenge, err := oauthGeneratePKCE()
-	if err != nil {
-		writeAdminErr(w, http.StatusInternalServerError, "生成 PKCE 失败: "+err.Error())
-		return
+	configuredClientID := ""
+	if s.cfg != nil {
+		configuredClientID = s.cfg.Creds.OAuthClientID
 	}
-	state := oauthRandomHex(16)
+	clientID := oauthAuthorizeClientID(body.ClientID, configuredClientID, redirectURI)
 	sess := &oauthSession{
-		ID:           "oa_" + oauthRandomHex(8),
+		ID:           "oa_" + id,
 		State:        state,
 		CodeVerifier: verifier,
 		RedirectURI:  redirectURI,
@@ -335,9 +379,14 @@ func (s *Server) handleOAuthBegin(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleLocalCallback(w http.ResponseWriter, r *http.Request, sess *oauthSession) {
 	q := r.URL.Query()
 	if e := q.Get("error"); e != "" {
-		s.finishOAuthSession(sess, "", fmt.Errorf("授权页返回错误: %s (%s)", e, q.Get("error_description")))
+		claimed, err := oauthSessions.claim(sess)
+		if err != nil {
+			writeAdminErr(w, http.StatusConflict, err.Error())
+			return
+		}
+		s.finishOAuthSession(claimed, "", fmt.Errorf("授权页返回错误"))
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write([]byte(oauthResultHTML("授权被取消", q.Get("error_description"))))
+		_, _ = w.Write([]byte(oauthResultHTML("授权被取消", "授权未完成，请重新发起授权。")))
 		return
 	}
 	code := q.Get("code")
@@ -346,7 +395,7 @@ func (s *Server) handleLocalCallback(w http.ResponseWriter, r *http.Request, ses
 		return
 	}
 
-	acctID, err := s.completeOAuthLogin(sess, code)
+	acctID, err := s.completeOAuthLogin(r.Context(), sess, code)
 	if err != nil {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(oauthResultHTML("换 token 失败", err.Error())))
@@ -356,25 +405,35 @@ func (s *Server) handleLocalCallback(w http.ResponseWriter, r *http.Request, ses
 	_, _ = w.Write([]byte(oauthResultHTML("授权成功", "账号 "+acctID+" 已入库并进入调度池，可关闭此页回到控制台查看。")))
 }
 
-// finishOAuthSession 记录会话终态并从反查表移除。
+// finishOAuthSession retains terminal status until the session expires.
 func (s *Server) finishOAuthSession(sess *oauthSession, accountID string, err error) {
-	sess.done = true
-	sess.account = accountID
-	if err != nil {
-		sess.errMsg = err.Error()
-	}
-	oauthSessions.remove(sess)
+	oauthSessions.finish(sess, accountID, err)
 }
 
 // completeOAuthLogin 换 token 并把账号写入 SQLite、热重载进池。
-func (s *Server) completeOAuthLogin(sess *oauthSession, code string) (string, error) {
-	tok, err := oauthExchangeToken(sess.ClientID, code, sess.CodeVerifier, sess.RedirectURI)
+func (s *Server) completeOAuthLogin(ctx context.Context, sess *oauthSession, code string) (string, error) {
+	claimed, err := oauthSessions.claim(sess)
+	if err != nil {
+		return "", err
+	}
+	sess = claimed
+	if s.sqlite == nil {
+		err := fmt.Errorf("账号数据库不可用")
+		s.finishOAuthSession(sess, "", err)
+		return "", err
+	}
+	id, err := oauthRandomHex(8)
+	if err != nil {
+		err = fmt.Errorf("生成 OAuth account ID 失败")
+		s.finishOAuthSession(sess, "", err)
+		return "", err
+	}
+	tok, err := s.oauthExchangeToken(ctx, sess.ClientID, code, sess.CodeVerifier, sess.RedirectURI)
 	if err != nil {
 		s.finishOAuthSession(sess, "", err)
 		return "", err
 	}
 
-	email := oauthEmailFromIDToken(tok.IDToken)
 	now := time.Now()
 	expires := now.Add(time.Duration(tok.ExpiresIn) * time.Second)
 	if tok.ExpiresIn <= 0 {
@@ -382,29 +441,44 @@ func (s *Server) completeOAuthLogin(sess *oauthSession, code string) (string, er
 	}
 
 	acct := config.AccountConfig{
-		ID:             "oauth-" + oauthRandomHex(4),
+		ID:             "oauth-" + id,
 		Name:           "OAuth 导入",
 		Enabled:        boolPtr(true),
 		AccessToken:    tok.AccessToken,
 		RefreshToken:   tok.RefreshToken,
 		ExpiresAt:      &expires,
-		Email:          email,
-		Plan:           "pro",
 		MaxConcurrency: 2,
 		Tags:           []string{"oauth"},
 		// refresh_token 与签发它的 client 绑定：导入用的哪个 client，
 		// 这个账号的刷新也必须用哪个 —— 逐账号记录，避免全局混用。
 		Headers: map[string]string{"oauth_client_id": sess.ClientID},
 	}
-	if email != "" {
-		acct.Name = email
+	metadata := creds.FromAccountConfig(acct)
+	idMetadata := creds.FromAccountConfig(config.AccountConfig{AccessToken: tok.IDToken})
+	if metadata.Email == "" {
+		metadata.Email = idMetadata.Email
 	}
+	if metadata.Plan == "" {
+		metadata.Plan = idMetadata.Plan
+	}
+	if metadata.AccountID == "" {
+		metadata.AccountID = idMetadata.AccountID
+	}
+	acct.Email, acct.Plan, acct.AccountID = metadata.Email, metadata.Plan, metadata.AccountID
+	if acct.Email != "" {
+		acct.Name = acct.Email
+	}
+	s.accountMu.Lock()
+	defer s.accountMu.Unlock()
 	if s.sqlite != nil {
 		if err := s.sqlite.SaveAccount(acct); err != nil {
 			s.finishOAuthSession(sess, "", fmt.Errorf("入库失败: %w", err))
 			return "", err
 		}
-		_ = s.syncPoolFromSQLite()
+		if err := s.syncPoolFromSQLiteLocked(); err != nil {
+			s.finishOAuthSession(sess, "", fmt.Errorf("账号已保存，但调度池重载失败: %w", err))
+			return "", err
+		}
 	}
 	s.finishOAuthSession(sess, acct.ID, nil)
 	return acct.ID, nil
@@ -463,7 +537,7 @@ func (s *Server) handleOAuthExchange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	acctID, err := s.completeOAuthLogin(sess, code)
+	acctID, err := s.completeOAuthLogin(r.Context(), sess, code)
 	if err != nil {
 		writeAdminErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -473,6 +547,7 @@ func (s *Server) handleOAuthExchange(w http.ResponseWriter, r *http.Request) {
 
 // oauthResultHTML 回调端浏览器看到的结果页。
 func oauthResultHTML(title, detail string) string {
+	title, detail = html.EscapeString(title), html.EscapeString(detail)
 	return "<!doctype html><meta charset='utf-8'><title>" + title + "</title>" +
 		"<body style='font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0'>" +
 		"<div style='text-align:center'><h2>" + title + "</h2><p style='color:#666'>" + detail + "</p>" +

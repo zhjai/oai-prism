@@ -21,6 +21,24 @@ type NativeStore interface {
 	LoadNativeBindings(since time.Time) ([]account.NativeBindingRecord, error)
 }
 
+type nativeBindingPruner interface {
+	PruneNativeBindings(since time.Time) error
+}
+
+func (r *Runner) currentNativeStore() NativeStore {
+	r.nativeStoreMu.RLock()
+	defer r.nativeStoreMu.RUnlock()
+	return r.nativeStore
+}
+
+func (r *Runner) pruneNativeBindings(now time.Time) {
+	if st, ok := r.currentNativeStore().(nativeBindingPruner); ok {
+		if err := st.PruneNativeBindings(now.Add(-nativeBindingTTL)); err != nil {
+			r.log.Warn("Failed to prune expired native bindings", "err", err)
+		}
+	}
+}
+
 // UseNativeStore 让绑定落盘，并载入未过期的旧绑定（网关重启后接回原来的上游会话）。
 func (r *Runner) UseNativeStore(st NativeStore) {
 	if st == nil {
@@ -46,7 +64,9 @@ func (r *Runner) UseNativeStore(st NativeStore) {
 		}
 	}
 	nativeBindings.mu.Unlock()
+	r.nativeStoreMu.Lock()
 	r.nativeStore = st
+	r.nativeStoreMu.Unlock()
 	if len(recs) > 0 {
 		r.log.Info("原生续接：已载入落盘的会话绑定", "count", len(recs))
 	}
@@ -84,14 +104,18 @@ func (b *nativeBinding) record() account.NativeBindingRecord {
 
 // persist 把绑定写盘（调用方持 b.mu）；上游会话作废时删除。落盘失败不影响本轮。
 func (r *Runner) persistNative(b *nativeBinding) {
-	if r == nil || r.nativeStore == nil || b.key == "" {
+	if r == nil || b.key == "" {
+		return
+	}
+	st := r.currentNativeStore()
+	if st == nil {
 		return
 	}
 	var err error
 	if b.cid == "" {
-		err = r.nativeStore.DeleteNativeBinding(b.key)
+		err = st.DeleteNativeBinding(b.key)
 	} else {
-		err = r.nativeStore.SaveNativeBinding(b.record())
+		err = st.SaveNativeBinding(b.record())
 	}
 	if err != nil {
 		r.log.Warn("原生续接：会话绑定落盘失败", "key", b.key, "err", err)
@@ -102,7 +126,7 @@ func (r *Runner) persistNative(b *nativeBinding) {
 // 不等它：那一轮提交时会连同别名一起落盘。
 func (r *Runner) AliasNative(alias, key string) {
 	b := nativeAlias(alias, key)
-	if b == nil || r.nativeStore == nil || !b.mu.TryLock() {
+	if b == nil || r.currentNativeStore() == nil || !b.mu.TryLock() {
 		return
 	}
 	r.persistNative(b)

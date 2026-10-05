@@ -39,7 +39,7 @@ case "$(uname -m)" in
   aarch64|arm64) arch=arm64 ;;
   *) echo "不支持的架构：$(uname -m)"; exit 1 ;;
 esac
-version=v0.1.0-zhjai.2
+version=v0.1.0-zhjai.5
 asset="oaiprism-${version}-linux-${arch}.tar.gz"
 url="https://github.com/zhjai/oai-prism/releases/download/${version}"
 curl -fLO "${url}/${asset}"
@@ -86,7 +86,7 @@ cd ..
 ```
 
 交叉编译：`make build-linux` 生成 `bin/oaiprism-linux-amd64` 和 `bin/oaiprism-linux-arm64`。
-生成与 Release 相同的完整安装包：`./tools/package_linux.sh v0.1.0-zhjai.2`，输出在 `dist/`。
+生成与 Release 相同的完整安装包：`./tools/package_linux.sh v0.1.0-zhjai.5`，输出在 `dist/`。
 
 如果后续使用本教程提供的 systemd 单元，请把完整运行目录放到 `~/.local/share/oaiprism`，
 或按实际位置修改单元的 `WorkingDirectory` 和 `ExecStart`。
@@ -99,14 +99,26 @@ Prism 使用 `prism_oai_access_token` / `prism_session_token`，不能用 ChatGP
 在安装目录执行：
 
 ```bash
-./oaiprism import -stdin -id main
+./oaiprism import -stdin
 ```
 
 粘贴 Cookie 后，在空行按 **Ctrl+D** 结束输入。此方式不把 Cookie 写进 shell 命令历史。
 默认会在线验证，成功后存入 `secrets/accounts.json`，文件权限为 `0600`。
 如果只持有 access token 或 refresh token，导入参数详见 [使用指南](使用指南.md#2-准备账号凭据)。
 
-也可以先启动服务，再在 Dashboard 的「账号与计划池」中走 OAuth 授权导入。
+默认按已识别的登录身份生成账号 ID；不同邮箱分别新增，同一身份再次导入会更新。
+显示「本次为更新」时不会增加账号总数。显式 `-id main` 会更新 main，添加不同账号时请省略 `-id` 或使用不同值。
+若账号在网页中已删除，终端显式重新导入会清除其删除记录；直接修改旧文件不会恢复删除账号。
+
+也可以先启动服务，再在 Dashboard 的「账号与计划池」点击「导入新账号」：
+
+1. 填写账号名称和从 Prism 复制的完整 Cookie。
+2. 设置最大并发数（默认 2，0 表示不限）、计划标签（默认自动识别）和启用状态。
+3. 保持「导入前校验凭据」开启，点击「确认导入」。代理和 Token 可在高级选项填写。
+4. 批量导入支持账号对象、数组或 `{"accounts":[...]}`。导入成功后筛选条件清空，新增账号显示在列表中。
+
+Cookie 只提交到当前网关并保存至 SQLite，不存入浏览器。建议使用本机、SSH 隧道或 HTTPS。
+OAuth 授权导入仍可使用；服务器模式可以手动粘贴浏览器回调地址完成授权。
 无账号时服务仍能启动，`/readyz` 返回 503；账号配置文件的更改会自动热加载。
 
 ## 启动与验证
@@ -170,6 +182,24 @@ curl -N http://127.0.0.1:8787/v1/chat/completions \
 升级时 SQLite 自动兼容迁移，已有账号、Key 和聊天记录保留。
 
 网页删除账号会同步移除 `accounts.json` 中对应的凭据，并在 SQLite 保存删除记录，防止旧文件快照或静态配置在重载、重启时重新导入。其他账号和文件中的自定义字段保留。若需恢复已删除的账号，请在网页中重新添加或导入；如仅需暂停调度，请使用启用开关。
+
+`accounts.json` 是凭据导入源，不是账号列表的唯一存储。手动从文件移除账号不会删除 SQLite 中的账号；请在网页中删除或停用。空文件或解析失败也不会清空已保存的账号。
+
+成功刷新后的 Cookie/Token 自动持久化到 SQLite，修改设置、重载和重启不会回滚到旧值。
+`HTTP 401 token_invalidated` 表示登录令牌被上游撤销，需要重新登录 Prism 并重新导入最新 Cookie；
+Plus/Pro 订阅不延长登录凭据有效期。`/auth/session` 未下发新会话 Cookie 的警告本身不证明账号失败，以实际校验结果为准。
+403 常见于代理出口或浏览器校验不一致；可配置 `upstream.http_proxy` 或账号代理，也可使用 Clash TUN。
+
+`pool.strategy: round_robin` 会让新的独立会话轮流使用可用账号。高并发由所有符合当前 Key 绑定范围、
+已启用且有空闲槽位的账号承担；达到上限、冷却或失效的账号会被跳过。同一对话保留账号粘性，
+显式选择账号时只使用该账号，不会把一条请求拆给多个账号。`least_inflight` 则优先选择在途请求最少的账号。
+
+`/metrics` 遵循网关鉴权，配置 Key 后 Prometheus 采集需携带 Bearer Key；`/healthz` 和 `/readyz` 仍可匿名探测。
+
+为支持网页复制已有 API Key，Key 原文保存在 SQLite 中，请像保护 Cookie 一样保护数据库及其备份。单进程删除或修改 Key 会立即使缓存失效；多个进程共用 SQLite 时，其他进程的 Key 缓存有效期为 5 秒，到期后的请求触发重新读取。数据库可读时，该请求会使用更新后的 Key；读库失败时继续使用旧缓存，更新延迟可能超过 5 秒。
+
+长期运行可设置 `request_logs.max_age: 720h`，每小时清理 30 天以前的请求流水；默认 `0s` 保留全部，
+不会删除已有日志。此设置不删除账号、密钥或网页聊天记录。
 
 ## 远程服务器访问
 
@@ -267,5 +297,7 @@ curl -fsS http://127.0.0.1:8787/healthz
 ```
 
 备份中包含凭据与数据库，请按私密文件保管。
+使用 `tools/start.sh` 前台运行时，由操作者按 Ctrl+C 停止、备份并解压新版，然后手动再次运行脚本。
+升级会迁移 SQLite，回滚到旧版前应同时考虑数据库兼容性；完整恢复旧备份会丢失备份后的新增数据。
 回滚时停止服务，从上一版安装包恢复程序和 `web/dist`，保留当前配置与 `secrets/`，再重启。
 从旧三进程架构迁移时先停掉自己原有的桥和 oracle，并改用直连配置；不要把旧 Windows 绝对路径带进 Linux。

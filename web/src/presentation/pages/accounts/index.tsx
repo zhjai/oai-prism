@@ -15,8 +15,10 @@ import {
   Typography,
   Popconfirm,
   Empty,
+  Grid,
   theme,
   Switch,
+  Alert,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import {
@@ -48,8 +50,37 @@ const { Text } = Typography;
 
 const EXPIRING_WINDOW_SEC = 7 * 86400;
 
+/**
+ * 账号身份列：第一行是账号名称，第二行是账号 ID 与绑定邮箱。
+ */
+const AccountIdentity: React.FC<{ record: AccountStats }> = ({ record }) => (
+  <div className="acct-ident">
+    <div className="acct-ident__line">
+      <span className="acct-ident__name">{record.name}</span>
+      <Tag
+        bordered={false}
+        color={record.source === 'oauth' ? 'purple' : 'default'}
+        className="acct-ident__tag"
+      >
+        {record.source}
+      </Tag>
+    </div>
+    <div className="acct-ident__line acct-ident__line--meta">
+      {record.id !== record.name && <span className="acct-ident__id">{record.id}</span>}
+      {record.email ? (
+        <Text type="secondary" className="acct-ident__email">{record.email}</Text>
+      ) : (
+        <Text type="secondary" className="acct-ident__email acct-ident__email--empty">未绑定邮箱</Text>
+      )}
+    </div>
+  </div>
+);
+
 export const AccountsPage: React.FC = () => {
   const { token } = theme.useToken();
+  const screens = Grid.useBreakpoint();
+  // 首次渲染 breakpoint 为空对象：用 === false 判定，避免桌面端闪一次窄屏布局
+  const narrow = screens.md === false;
   const {
     accounts,
     readyCount,
@@ -71,11 +102,15 @@ export const AccountsPage: React.FC = () => {
   const [planFilter, setPlanFilter] = useState<string>('all');
   const [statusFilter, setStatusFilter] = useState<string>('all');
 
-  // 分页状态
-  const [currentPage, setCurrentPage] = useState(1);
+  // 分页状态：只存"用户请求的页码"，实际展示的页码由过滤结果派生（见 currentPage）
+  const [requestedPage, setRequestedPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
+
+  // 进行中的动作：同一行同一时刻只允许一个动作，避免重复提交把状态改乱
   const [refreshingId, setRefreshingId] = useState<string | null>(null);
   const [togglingId, setTogglingId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [reloading, setReloading] = useState(false);
 
   useEffect(() => {
     fetchAccounts();
@@ -103,6 +138,31 @@ export const AccountsPage: React.FC = () => {
     });
   }, [accounts, searchText, planFilter, statusFilter]);
 
+  const filtersActive = Boolean(searchText.trim()) || planFilter !== 'all' || statusFilter !== 'all';
+
+  const resetFilters = () => {
+    setSearchText('');
+    setPlanFilter('all');
+    setStatusFilter('all');
+    setRequestedPage(1);
+  };
+
+  // 过滤后条数变少时页码自动收回有效范围：派生而非写入 state，
+  // 避免"渲染后 setState"的额外一轮渲染与警告。
+  const pageCount = Math.max(1, Math.ceil(filteredAccounts.length / pageSize));
+  const currentPage = Math.min(requestedPage, pageCount);
+
+  /**
+   * 导入成功后的收尾：只在筛选或页码真的偏离默认值时才写入，
+   * 保持 setState 幂等（React 会跳过同值更新），也避免多一次无谓的重渲染。
+   */
+  const handleImported = () => {
+    if (searchText) setSearchText('');
+    if (planFilter !== 'all') setPlanFilter('all');
+    if (statusFilter !== 'all') setStatusFilter('all');
+    if (requestedPage !== 1) setRequestedPage(1);
+  };
+
   // 账号池概览指标
   const overview = useMemo(() => {
     let cooling = 0;
@@ -124,20 +184,59 @@ export const AccountsPage: React.FC = () => {
 
   const readyPct = accounts.length > 0 ? Math.round((readyCount / accounts.length) * 100) : 0;
   // 未连接网关时数据未知：显示"—"而不是 0，避免误以为账号被清空
-  const unknown = blocked && accounts.length === 0;
+  const unknown = (blocked || !!error) && accounts.length === 0;
   const kpi = (n: number) => (unknown ? '—' : n);
   const unit = unknown ? undefined : '个';
 
+  const handleReload = async () => {
+    if (reloading) return;
+    setReloading(true);
+    try {
+      await reloadPool();
+      message.success('凭据已重载，账号池已刷新');
+    } catch (err: any) {
+      message.error(`重载失败：${err.message}`);
+    } finally {
+      setReloading(false);
+    }
+  };
+
   // 单账号后端刷新
   const handleSingleRefresh = async (record: AccountStats) => {
+    if (refreshingId) return;
     setRefreshingId(record.id);
     try {
       const res = await refreshAccount(record.id);
       message.success(`账号 [${record.name}] 凭据已刷新！计划: ${res.plan}，到期: ${formatDate(res.expires_at)}`);
     } catch (err: any) {
-      message.error(`刷新失败: ${err.message}`);
+      message.error(`刷新失败：${err.message}`);
     } finally {
       setRefreshingId(null);
+    }
+  };
+
+  const handleToggle = async (record: AccountStats, enabled: boolean) => {
+    if (togglingId) return;
+    setTogglingId(record.id);
+    try {
+      await updateAccount(record.id, { enabled });
+      message.success(`[${record.name}] 已${enabled ? '启用' : '停用'}`);
+    } catch (err: any) {
+      message.error(err.message || '更新失败');
+    } finally {
+      setTogglingId(null);
+    }
+  };
+
+  const handleDelete = async (record: AccountStats) => {
+    setDeletingId(record.id);
+    try {
+      await deleteAccount(record.id);
+      message.success(`账号 [${record.name}] 已删除`);
+    } catch (err: any) {
+      message.error(`删除失败：${err.message}`);
+    } finally {
+      setDeletingId(null);
     }
   };
 
@@ -148,45 +247,18 @@ export const AccountsPage: React.FC = () => {
       key: 'name',
       // 不设宽度：吃掉其余列分完后的剩余空间
       fixed: 'left',
-      render: (_, record) => (
-        <div style={{ minWidth: 0, lineHeight: 1.45 }}>
-          <Space size={6} style={{ maxWidth: '100%' }}>
-            <Tooltip title={record.name !== record.id ? record.name : undefined}>
-              <Text strong style={{ cursor: 'default' }}>{record.id}</Text>
-            </Tooltip>
-            <Tag
-              bordered={false}
-              color={record.source === 'oauth' ? 'purple' : 'default'}
-              style={{ fontSize: 11, lineHeight: '18px', paddingInline: 6, marginInlineEnd: 0 }}
-            >
-              {record.source}
-            </Tag>
-          </Space>
-          {record.email ? (
-            <Text
-              type="secondary"
-              copyable={{ text: record.email }}
-              ellipsis
-              style={{ display: 'block', fontSize: 12, maxWidth: '100%' }}
-            >
-              {record.email}
-            </Text>
-          ) : (
-            <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>未绑定邮箱</Text>
-          )}
-        </div>
-      ),
+      render: (_, record) => <AccountIdentity record={record} />,
     },
     {
       title: '计划',
       dataIndex: 'plan',
       key: 'plan',
-      width: 96,
+      width: 92,
       render: (plan) => {
         const p = (plan || 'pro').toLowerCase();
         const color = p.includes('team') || p.includes('enterprise') ? 'gold' : p.includes('pro') ? 'blue' : 'default';
         return (
-          <Tag bordered={false} color={color} style={{ fontWeight: 600, textTransform: 'uppercase', marginInlineEnd: 0 }}>
+          <Tag bordered={false} color={color} style={{ fontWeight: 600, marginInlineEnd: 0 }}>
             {plan || '未知'}
           </Tag>
         );
@@ -196,12 +268,12 @@ export const AccountsPage: React.FC = () => {
       title: '调度状态',
       dataIndex: 'enabled',
       key: 'enabled',
-      width: 108,
+      width: 122,
       render: (enabled, record) => {
         if (!enabled) return <Badge status="default" text="已停用" />;
         if (record.cooldown_sec > 0) {
           return (
-            <Tooltip title={`冷却中：因失败过多暂时避让，剩余 ${Math.round(record.cooldown_sec)} 秒后自动解除`}>
+            <Tooltip title={`剩余 ${Math.round(record.cooldown_sec)} 秒后自动解除`}>
               <Badge status="warning" text={`冷却 ${Math.round(record.cooldown_sec)}s`} />
             </Tooltip>
           );
@@ -219,7 +291,7 @@ export const AccountsPage: React.FC = () => {
     {
       title: '凭据构成',
       key: 'credentials',
-      width: 164,
+      width: 150,
       render: (_, record) => (
         <span className="cred-tags">
           <Tooltip title={record.has_access_token ? 'Access Token 正常' : '缺失 Access Token'}>
@@ -239,33 +311,27 @@ export const AccountsPage: React.FC = () => {
     {
       title: '启用',
       key: 'toggle',
-      width: 88,
-      render: (_: unknown, record: AccountStats) => (
-        <Switch
-          checked={record.enabled}
-          checkedChildren="启用"
-          unCheckedChildren="停用"
-          loading={togglingId === record.id}
-          aria-label={`${record.name} 启用状态`}
-          onChange={async (enabled) => {
-            setTogglingId(record.id);
-            try {
-              await updateAccount(record.id, { enabled });
-              message.success(`账号已${enabled ? '启用' : '停用'}`);
-            } catch (err: any) {
-              message.error(err.message || '更新失败');
-            } finally {
-              setTogglingId(null);
-            }
-          }}
-        />
-      ),
+      width: 84,
+      render: (_: unknown, record: AccountStats) => {
+        const rowBusy = refreshingId === record.id || deletingId === record.id;
+        return (
+          <Switch
+            checked={record.enabled}
+            checkedChildren="启用"
+            unCheckedChildren="停用"
+            loading={togglingId === record.id}
+            disabled={rowBusy}
+            aria-label={`${record.name} 启用状态`}
+            onChange={(enabled) => handleToggle(record, enabled)}
+          />
+        );
+      },
     },
     {
       title: 'Token 到期',
       dataIndex: 'token_expires',
       key: 'token_expires',
-      width: 116,
+      width: 112,
       render: (expires, record) => {
         if (!expires) return <Text type="secondary">永久/静态</Text>;
         const days = Math.round((record.expires_in_sec || 0) / 86400);
@@ -283,7 +349,7 @@ export const AccountsPage: React.FC = () => {
       // 并发与请求计数合并为一列：两行紧凑展示，窄屏也不挤压账号列
       title: <Tooltip title="在途请求 / 并发上限；本次启动以来的请求与失败数">负载</Tooltip>,
       key: 'load',
-      width: 120,
+      width: 118,
       render: (_, record) => {
         const max = record.max_concurrency > 0 ? record.max_concurrency : '∞';
         return (
@@ -305,43 +371,58 @@ export const AccountsPage: React.FC = () => {
     {
       title: '操作',
       key: 'actions',
-      width: 128,
+      width: 132,
       fixed: 'right',
       render: (_, record) => (
         <Space size={2}>
           <Tooltip title="明细">
-            <Button type="text" size="small" icon={<EyeOutlined />} onClick={() => openDetailDrawer(record)} />
+            <Button
+              type="text"
+              size="small"
+              aria-label="明细"
+              icon={<EyeOutlined />}
+              onClick={() => openDetailDrawer(record)}
+            />
           </Tooltip>
           <Tooltip title="编辑">
-            <Button type="text" size="small" icon={<EditOutlined />} onClick={() => openEditModal(record)} />
+            <Button
+              type="text"
+              size="small"
+              aria-label="编辑"
+              icon={<EditOutlined />}
+              onClick={() => openEditModal(record)}
+            />
           </Tooltip>
           <Tooltip title="刷新凭据">
             <Button
               type="text"
               size="small"
+              aria-label="刷新凭据"
               icon={<SyncOutlined spin={refreshingId === record.id} />}
-              disabled={refreshingId === record.id}
-              onClick={() => handleSingleRefresh(record)}
+              disabled={refreshingId === record.id || deletingId === record.id || togglingId === record.id}
+              onClick={() => void handleSingleRefresh(record)}
             />
           </Tooltip>
           <Popconfirm
             title="确定删除此账号？"
             description="将移除该账号及凭据文件中的对应记录，重载后不会恢复。"
-            onConfirm={async () => {
-              try {
-                await deleteAccount(record.id);
-                message.success(`账号 [${record.name}] 已删除`);
-              } catch (err: any) {
-                message.error(`删除失败: ${err.message}`);
-              }
-            }}
+            onConfirm={() => void handleDelete(record)}
             okText="确定删除"
             cancelText="取消"
-            okButtonProps={{ danger: true }}
+            okButtonProps={{ danger: true, loading: deletingId === record.id }}
+            disabled={deletingId !== null}
           >
-            <Tooltip title="删除">
-              <Button type="text" danger size="small" icon={<DeleteOutlined />} />
-            </Tooltip>
+            {/* 触发按钮不再套 Tooltip：浮层会在确认按钮上方持续捕获指针事件，
+                让"确定删除"点不动。按钮已有 aria-label="删除"，语义不丢。 */}
+            <Button
+              type="text"
+              danger
+              size="small"
+              aria-label="删除"
+              title="删除"
+              icon={<DeleteOutlined />}
+              loading={deletingId === record.id}
+            />
           </Popconfirm>
         </Space>
       ),
@@ -349,10 +430,22 @@ export const AccountsPage: React.FC = () => {
   ];
 
   return (
-    <div className="page-fill" style={{ gap: 16 }}>
-    <Row gutter={[16, 16]} style={{ flexShrink: 0 }}>
-      <Col xs={12} xl={6}>
+    <div className="page-fill acct-page" style={{ gap: 16 }}>
+    {error && accounts.length > 0 && (
+      <Alert
+        type="error"
+        showIcon
+        title={`账号列表更新失败：${error}`}
+        description="当前显示上次成功加载的数据。"
+        action={<Button onClick={() => void fetchAccounts()} loading={loading} disabled={loading}>重试加载</Button>}
+      />
+    )}
+    {/* 窄屏：四张指标卡各占一行、紧凑单行呈现，把视口高度让给表格；
+        桌面：仍是原来的四列大卡，保持既有密度 */}
+    <Row gutter={narrow ? [16, 8] : [16, 16]} style={{ flexShrink: 0 }}>
+      <Col xs={24} sm={12} xl={6}>
         <StatCard
+          compact={narrow}
           title="账号总数"
           value={kpi(accounts.length)}
           suffix={unit}
@@ -362,8 +455,9 @@ export const AccountsPage: React.FC = () => {
           footer={`在途请求 ${overview.inflight}`}
         />
       </Col>
-      <Col xs={12} xl={6}>
+      <Col xs={24} sm={12} xl={6}>
         <StatCard
+          compact={narrow}
           title="就绪可调度"
           value={kpi(readyCount)}
           suffix={unit}
@@ -373,8 +467,9 @@ export const AccountsPage: React.FC = () => {
           footer={`可调度占比 ${readyPct}%`}
         />
       </Col>
-      <Col xs={12} xl={6}>
+      <Col xs={24} sm={12} xl={6}>
         <StatCard
+          compact={narrow}
           title="冷却 / 停用"
           value={kpi(overview.cooling + overview.disabled)}
           suffix={unit}
@@ -384,8 +479,9 @@ export const AccountsPage: React.FC = () => {
           footer={`冷却中 ${overview.cooling} · 已停用 ${overview.disabled}`}
         />
       </Col>
-      <Col xs={12} xl={6}>
+      <Col xs={24} sm={12} xl={6}>
         <StatCard
+          compact={narrow}
           title="7 天内凭据到期"
           value={kpi(overview.expiring)}
           suffix={unit}
@@ -402,29 +498,33 @@ export const AccountsPage: React.FC = () => {
     </Row>
     <Card
       styles={{
-        // 卡片撑满剩余高度；body 为纵向 flex：工具栏固定、表格撑满、分页贴底
-        body: { padding: '16px 20px', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' },
+        // 桌面：卡片撑满剩余高度，body 纵向 flex（工具栏固定、表格撑满、分页贴底）。
+        // 窄屏：不参与填充布局 —— 卡片按内容取自然高度，否则表格会溢出到卡片边框之外。
+        body: narrow
+          ? { padding: '14px 14px' }
+          : { padding: '16px 20px', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' },
       }}
-      style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', width: '100%', boxShadow: token.boxShadowTertiary }}
+      style={
+        narrow
+          ? { width: '100%', boxShadow: token.boxShadowTertiary }
+          : { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', width: '100%', boxShadow: token.boxShadowTertiary }
+      }
       title={
         <Space size={8}>
           <span style={{ fontWeight: 600 }}>账号列表</span>
-          <Tag bordered={false} style={{ marginInlineEnd: 0 }}>{filteredAccounts.length}</Tag>
+          <Tag bordered={false} style={{ marginInlineEnd: 0 }}>
+            {filtersActive ? `${filteredAccounts.length} / ${accounts.length}` : accounts.length}
+          </Tag>
         </Space>
       }
       extra={
-        <Space>
+        <Space wrap>
           <Button
             icon={<ReloadOutlined />}
-            onClick={async () => {
-              try {
-                await reloadPool();
-                message.success('凭据已重载，账号池已刷新');
-              } catch (err: any) {
-                message.error(`重载失败: ${err.message}`);
-              }
-            }}
-            loading={loading}
+            onClick={() => void handleReload()}
+            loading={reloading}
+            disabled={reloading}
+            aria-label="重载并刷新"
           >
             重载并刷新
           </Button>
@@ -438,81 +538,70 @@ export const AccountsPage: React.FC = () => {
         </Space>
       }
     >
-      {/* 搜索与过滤工具栏（固定高度，不参与表格弹性） */}
-      <Space orientation="horizontal" size="middle" style={{ marginBottom: 16, width: '100%', flexWrap: 'wrap', flexShrink: 0 }}>
+      {/* 搜索与过滤工具栏（固定高度，不参与表格弹性；窄屏自动换行撑满） */}
+      <div className="acct-toolbar">
         <Input
           placeholder="搜索账号 ID、名称或邮箱..."
+          aria-label="搜索账号"
           prefix={<SearchOutlined style={{ color: token.colorTextQuaternary }} />}
           value={searchText}
           onChange={(e) => {
             setSearchText(e.target.value);
-            setCurrentPage(1);
+            setRequestedPage(1);
           }}
-          style={{ width: 260 }}
+          style={{ width: narrow ? '100%' : 260, flex: narrow ? '1 1 100%' : undefined }}
           allowClear
         />
 
-        <Space orientation="horizontal" size="small">
-          <Text type="secondary">计划等级:</Text>
-          <Select
-            value={planFilter}
-            onChange={(v) => {
-              setPlanFilter(v);
-              setCurrentPage(1);
-            }}
-            style={{ width: 120 }}
-            options={[
-              { value: 'all', label: '全部计划' },
-              { value: 'pro', label: 'Pro 计划' },
-              { value: 'team', label: 'Team 计划' },
-              { value: 'free', label: 'Free 计划' },
-            ]}
-          />
-        </Space>
+        <Select
+          aria-label="按计划筛选"
+          value={planFilter}
+          onChange={(v) => {
+            setPlanFilter(v);
+            setRequestedPage(1);
+          }}
+          style={{ minWidth: narrow ? 0 : 130, flex: narrow ? '1 1 130px' : undefined }}
+          options={[
+            { value: 'all', label: '全部计划' },
+            { value: 'pro', label: 'Pro 计划' },
+            { value: 'team', label: 'Team 计划' },
+            { value: 'free', label: 'Free 计划' },
+          ]}
+        />
 
-        <Space orientation="horizontal" size="small">
-          <Text type="secondary">调度状态:</Text>
-          <Select
-            value={statusFilter}
-            onChange={(v) => {
-              setStatusFilter(v);
-              setCurrentPage(1);
-            }}
-            style={{ width: 130 }}
-            options={[
-              { value: 'all', label: '全部状态' },
-              { value: 'enabled', label: '健康可用' },
-              { value: 'cooldown', label: '冷却中' },
-              { value: 'disabled', label: '已停用' },
-            ]}
-          />
-        </Space>
+        <Select
+          aria-label="按调度状态筛选"
+          value={statusFilter}
+          onChange={(v) => {
+            setStatusFilter(v);
+            setRequestedPage(1);
+          }}
+          style={{ minWidth: narrow ? 0 : 140, flex: narrow ? '1 1 140px' : undefined }}
+          options={[
+            { value: 'all', label: '全部状态' },
+            { value: 'enabled', label: '健康可用' },
+            { value: 'cooldown', label: '冷却中' },
+            { value: 'disabled', label: '已停用' },
+          ]}
+        />
 
-        {(searchText || planFilter !== 'all' || statusFilter !== 'all') && (
-          <Button
-            type="link"
-            size="small"
-            onClick={() => {
-              setSearchText('');
-              setPlanFilter('all');
-              setStatusFilter('all');
-              setCurrentPage(1);
-            }}
-          >
+        {filtersActive && (
+          <Button type="link" size="small" onClick={resetFilters}>
             重置筛选
           </Button>
         )}
-      </Space>
+      </div>
 
-      {/* 标准自适应分页表格：表格撑满剩余高度、行多时内部滚动、分页固定底部（.table-fill） */}
-      <div className="table-fill">
+      {/* 标准自适应分页表格：桌面撑满剩余高度（.table-fill）；窄屏随页面滚动（.table-auto） */}
+      <div className={narrow ? 'table-auto' : 'table-fill'}>
         <Table
           rowKey="id"
           columns={columns}
           dataSource={filteredAccounts}
           loading={loading}
-          // x = 账号列最小 200 + 其余列宽之和；容器更宽时余量全部归账号列
-          scroll={{ x: 932, y: 200 }}
+          // x = 账号列最小 240 + 其余列宽之和；容器更宽时余量全部归账号列
+          // y = 视口内固定滚动区：桌面 420px（弹性容器再拉伸），窄屏由页面滚动承载
+          scroll={{ x: 1048, y: narrow ? undefined : 420 }}
           locale={{
             emptyText: blocked ? (
               <Empty
@@ -526,16 +615,20 @@ export const AccountsPage: React.FC = () => {
               </Empty>
             ) : error ? (
               <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={`加载失败：${error}`}>
-                <Button onClick={fetchAccounts}>重试</Button>
+                <Button onClick={() => void fetchAccounts()} loading={loading} disabled={loading}>
+                  重试
+                </Button>
               </Empty>
             ) : accounts.length === 0 ? (
-              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="账号池还是空的">
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有账号">
                 <Button type="primary" icon={<PlusOutlined />} onClick={() => setImportModalOpen(true)}>
                   导入新账号
                 </Button>
               </Empty>
             ) : (
-              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="没有符合筛选条件的账号" />
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="没有符合筛选条件的账号">
+                <Button onClick={resetFilters}>重置筛选</Button>
+              </Empty>
             ),
           }}
           pagination={{
@@ -544,17 +637,18 @@ export const AccountsPage: React.FC = () => {
             total: filteredAccounts.length,
             showSizeChanger: true,
             pageSizeOptions: ['5', '10', '20', '50'],
-            showQuickJumper: true,
+            showQuickJumper: !narrow,
+            simple: narrow,
             showTotal: (total, range) => `第 ${range[0]}-${range[1]} 条 / 共 ${total} 条账号`,
             onChange: (page, size) => {
-              setCurrentPage(page);
+              setRequestedPage(page);
               setPageSize(size);
             },
           }}
         />
       </div>
 
-      <AccountImportModal />
+      <AccountImportModal onImported={handleImported} />
       <PlanDetailDrawer />
       <AccountEditModal />
     </Card>

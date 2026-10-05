@@ -33,9 +33,37 @@ export interface AdminAccountsResponse {
   accounts: AccountStats[];
 }
 
-export interface AccountImportInput {
+export interface AccountConfig {
+  id?: string;
   name?: string;
-  rawText: string;
+  enabled?: boolean;
+  cookies?: string;
+  cookie_map?: Record<string, string>;
+  session_token?: string;
+  access_token?: string;
+  refresh_token?: string;
+  expires_at?: string | null;
+  account_id?: string;
+  email?: string;
+  plan?: string;
+  proxy?: string;
+  max_concurrency?: number;
+  rate_per_second?: number;
+  rate_burst?: number;
+  weight?: number;
+  headers?: Record<string, string>;
+  tags?: string[];
+}
+
+export type AccountImportInput = {
+  verify?: boolean;
+} & ({ name?: string; rawText: string; accounts?: never } | { accounts: AccountConfig[]; rawText?: never });
+
+export interface AdminAccountImportResponse {
+  status: string;
+  created: number;
+  total: number;
+  accounts: { id: string; name: string; email: string; plan: string }[];
 }
 
 export interface AdminRefreshResponse {

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -167,15 +168,19 @@ type Runner struct {
 	journal *PendingJournal
 	app     *metrics.App
 	// nativeStore 让原生续接的绑定落盘（见 native_store.go）；nil 时只在内存里。
-	nativeStore NativeStore
+	nativeStoreMu sync.RWMutex
+	nativeStore   NativeStore
 
 	bucketSeq atomic.Uint64
 
 	accountRetries int
+	cleanupCancel  context.CancelFunc
+	cleanupWG      sync.WaitGroup
 }
 
 // NewRunner 构造运行器。
 func NewRunner(cfg *config.Config, log *slog.Logger, pool *account.Pool, client *prism.Client, app *metrics.App) *Runner {
+	ctx, cancel := context.WithCancel(context.Background())
 	r := &Runner{
 		cfg:            cfg,
 		log:            log,
@@ -187,17 +192,41 @@ func NewRunner(cfg *config.Config, log *slog.Logger, pool *account.Pool, client 
 		journal:        NewPendingJournal(),
 		app:            app,
 		accountRetries: 2,
+		cleanupCancel:  cancel,
 	}
-	go r.projects.gc(context.Background())
-	go r.sandboxes.gc(context.Background())
+	r.cleanupWG.Add(3)
 	go func() {
+		defer r.cleanupWG.Done()
+		r.projects.gc(ctx)
+	}()
+	go func() {
+		defer r.cleanupWG.Done()
+		r.sandboxes.gc(ctx)
+	}()
+	go func() {
+		defer r.cleanupWG.Done()
 		ticker := time.NewTicker(10 * time.Minute)
 		defer ticker.Stop()
-		for range ticker.C {
-			r.journal.Cleanup(1 * time.Hour)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				r.journal.Cleanup(1 * time.Hour)
+				r.pruneNativeBindings(time.Now())
+			}
 		}
 	}()
 	return r
+}
+
+// Close stops and joins the runner's background cleanup workers.
+func (r *Runner) Close() {
+	if r == nil || r.cleanupCancel == nil {
+		return
+	}
+	r.cleanupCancel()
+	r.cleanupWG.Wait()
 }
 
 // ProjectCacheSize 供指标使用。
@@ -326,6 +355,13 @@ func (r *Runner) acquire(ctx context.Context, req *RunRequest) (*account.Lease, 
 		}
 		r.app.AccountPick.Inc("pinned")
 		return lease, nil
+	}
+	// Persisted conversations outlive the pool's in-memory sticky map.
+	if req.BoundAccountID != "" {
+		if lease, err := r.pool.AcquirePinned(ctx, req.BoundAccountID); err == nil {
+			r.app.AccountPick.Inc("bound")
+			return lease, nil
+		}
 	}
 	lease, err := r.pool.Acquire(ctx, req.StickyKey)
 	if err != nil {

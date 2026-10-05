@@ -52,8 +52,8 @@ func TestStartResponse_NoReplayOn5xx(t *testing.T) {
 	}
 }
 
-// 429/503 是上游明确拒收：start 可以安全重试。
-func TestStartResponse_RetriesOnExplicitReject(t *testing.T) {
+// A 503 may come from an intermediary after dispatch; it cannot prove rejection.
+func TestStartResponse_NoReplayOn503(t *testing.T) {
 	var starts atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if starts.Add(1) == 1 {
@@ -67,10 +67,10 @@ func TestStartResponse_RetriesOnExplicitReject(t *testing.T) {
 	c := newTestClient(t, srv.URL)
 
 	resp, err := c.StartResponse(context.Background(), Principal{}, &StartRequest{})
-	if err != nil || resp.RequestID != "req-1" {
-		t.Fatalf("503 后应重试成功: %+v err=%v", resp, err)
+	if err == nil || resp != nil {
+		t.Fatalf("503 should fail without replay: %+v err=%v", resp, err)
 	}
-	if starts.Load() != 2 {
-		t.Fatalf("应恰好重试一次，实际 %d 次", starts.Load())
+	if starts.Load() != 1 {
+		t.Fatalf("start replayed: %d", starts.Load())
 	}
 }

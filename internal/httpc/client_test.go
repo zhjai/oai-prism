@@ -263,16 +263,26 @@ func TestPick(t *testing.T) {
 }
 
 func TestProxyFunc(t *testing.T) {
-	if f := proxyFunc(""); f != nil {
+	if f, err := proxyFunc(""); f != nil || err != nil {
 		t.Fatal("空代理应返回 nil（直连）")
 	}
-	if f := proxyFunc("http://127.0.0.1:7890"); f == nil {
+	if f, err := proxyFunc("http://127.0.0.1:7890"); f == nil || err != nil {
 		t.Fatal("http 代理应被识别")
 	} else {
 		req, _ := http.NewRequest(http.MethodGet, "https://x.com", nil)
 		u, err := f(req)
 		if err != nil || u.Host != "127.0.0.1:7890" {
 			t.Fatalf("代理 URL 错误: %v %v", u, err)
+		}
+	}
+	for _, raw := range []string{"not-a-url", "http://", "ftp://localhost:21", "://bad"} {
+		if _, err := proxyFunc(raw); err == nil {
+			t.Errorf("invalid proxy accepted: %q", raw)
+		}
+	}
+	for _, scheme := range []string{"socks5", "socks5h"} {
+		if f, err := proxyFunc(scheme + "://127.0.0.1:1080"); f == nil || err != nil {
+			t.Errorf("SOCKS proxy rejected: %v", err)
 		}
 	}
 }

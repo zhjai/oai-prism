@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -22,15 +23,16 @@ import (
 
 // Config 是顶层配置。
 type Config struct {
-	Server   ServerConfig   `yaml:"server"`
-	Upstream UpstreamConfig `yaml:"upstream"`
-	Creds    CredsConfig    `yaml:"creds"`
-	Pool     PoolConfig     `yaml:"pool"`
-	Facade   FacadeConfig   `yaml:"facade"`
-	RawProxy RawProxyConfig `yaml:"raw_proxy"`
-	Metrics  MetricsConfig  `yaml:"metrics"`
-	Capture  CaptureConfig  `yaml:"capture"`
-	Log      LogConfig      `yaml:"log"`
+	Server      ServerConfig     `yaml:"server"`
+	Upstream    UpstreamConfig   `yaml:"upstream"`
+	Creds       CredsConfig      `yaml:"creds"`
+	Pool        PoolConfig       `yaml:"pool"`
+	Facade      FacadeConfig     `yaml:"facade"`
+	RawProxy    RawProxyConfig   `yaml:"raw_proxy"`
+	Metrics     MetricsConfig    `yaml:"metrics"`
+	Capture     CaptureConfig    `yaml:"capture"`
+	Log         LogConfig        `yaml:"log"`
+	RequestLogs RequestLogConfig `yaml:"request_logs"`
 }
 
 // ServerConfig 描述对外监听。
@@ -448,6 +450,11 @@ type LogConfig struct {
 	Format string `yaml:"format"`
 }
 
+type RequestLogConfig struct {
+	MaxAge        time.Duration `yaml:"max_age"`
+	PruneInterval time.Duration `yaml:"prune_interval"`
+}
+
 // Default 返回内置默认配置。
 func Default() *Config {
 	return &Config{
@@ -741,6 +748,12 @@ func Load(path string) (*Config, error) {
 
 // normalize 补齐零值、做基本合法性校验。
 func (c *Config) normalize() error {
+	if c.RequestLogs.MaxAge < 0 {
+		return fmt.Errorf("request_logs.max_age 不能为负数")
+	}
+	if c.RequestLogs.MaxAge > 0 && c.RequestLogs.PruneInterval <= 0 {
+		c.RequestLogs.PruneInterval = time.Hour
+	}
 	// 账户文件相对路径基于配置文件所在目录解析更符合直觉，
 	// 但为了脚本可预测，这里统一按进程工作目录解析，仅在缺失时提示。
 	if c.Creds.File == "" && c.Creds.Mode == "file" {
@@ -905,7 +918,7 @@ func (c *Config) normalize() error {
 
 // Addr 返回监听地址。
 func (s ServerConfig) Addr() string {
-	return fmt.Sprintf("%s:%d", s.Host, s.Port)
+	return net.JoinHostPort(strings.Trim(s.Host, "[]"), strconv.Itoa(s.Port))
 }
 
 // applyEnv 支持最常用的几项用环境变量覆盖。
@@ -1037,27 +1050,17 @@ func applyEnv(c *Config) {
 	if cookieVal == "" {
 		cookieVal = os.Getenv("PRISM_COOKIE")
 	}
-	if cookieVal != "" {
-		c.Creds.Accounts = append([]AccountConfig{{
-			ID:      "env-default",
-			Name:    "env-default",
-			Cookies: cookieVal,
-		}}, c.Creds.Accounts...)
-	}
-
-	if v := os.Getenv(EnvPrefix + "ACCESS_TOKEN"); v != "" {
-		c.Creds.Accounts = append([]AccountConfig{{
-			ID:          "env-default",
-			Name:        "env-default",
-			AccessToken: v,
-		}}, c.Creds.Accounts...)
-	}
-	if v := os.Getenv(EnvPrefix + "REFRESH_TOKEN"); v != "" {
-		c.Creds.Accounts = append([]AccountConfig{{
-			ID:           "env-default",
-			Name:         "env-default",
-			RefreshToken: v,
-		}}, c.Creds.Accounts...)
+	envAccount := AccountConfig{ID: "env-default", Name: "env-default", Cookies: cookieVal,
+		AccessToken: os.Getenv(EnvPrefix + "ACCESS_TOKEN"), RefreshToken: os.Getenv(EnvPrefix + "REFRESH_TOKEN"), MaxConcurrency: 2}
+	if envAccount.Cookies != "" || envAccount.AccessToken != "" || envAccount.RefreshToken != "" {
+		list := make([]AccountConfig, 0, len(c.Creds.Accounts)+1)
+		list = append(list, envAccount)
+		for _, a := range c.Creds.Accounts {
+			if a.ID != envAccount.ID {
+				list = append(list, a)
+			}
+		}
+		c.Creds.Accounts = list
 	}
 }
 

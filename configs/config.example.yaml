@@ -131,7 +131,7 @@ creds:
   # accounts:
   #   - id: main
   #     name: 主账号
-  #     cookies: "__Secure-next-auth.session-token=eyJ..."
+  #     cookies: "prism_oai_access_token=eyJ...; prism_session_token=..."
   #     max_concurrency: 2
   #   - id: backup
   #     name: 备用账号
@@ -424,7 +424,7 @@ raw_proxy:
     - /api/project-files/
     - /api/auth/session
 
-  # 允许调用方用自己的凭据覆盖账号池。仅本地调试时开启。
+  # 保留字段，尚未实现；开启会提示警告，仍使用账号池凭据。
   passthrough_auth: false
 
   strip_headers: []
@@ -458,3 +458,8 @@ capture:
 log:
   level: info # debug | info | warn | error
   format: json # json | text
+
+# SQLite 请求流水保留期限。0 为保留全部，不会自动删除已有数据。
+request_logs:
+  max_age: 0s # 例如 720h，保留最近 30 天；0s 表示保留全部
+  prune_interval: 1h

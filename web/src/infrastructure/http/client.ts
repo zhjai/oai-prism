@@ -81,7 +81,13 @@ httpClient.interceptors.response.use(
       error.message ||
       '网络请求异常';
     const status = error.response?.status;
-    if ((status === 401 || status === 403) && GATEWAY_AUTH_CODES.has(data?.error?.code)) {
+    const storedKey = getApiKey();
+    const requestAuthorization = error.config?.headers?.Authorization || '';
+    const usedCurrentCredential = storedKey
+      ? requestAuthorization === `Bearer ${storedKey}`
+      : !requestAuthorization;
+    // Candidate-key checks and obsolete requests must not disconnect a valid session.
+    if (usedCurrentCredential && (status === 401 || status === 403) && GATEWAY_AUTH_CODES.has(data?.error?.code)) {
       authFailureListeners.forEach((fn) => fn(msg));
     }
     return Promise.reject(new Error(msg));

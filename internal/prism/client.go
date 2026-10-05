@@ -110,8 +110,8 @@ func New(base *httpc.Client, up UpstreamOptions, schema SchemaOptions) *Client {
 	if up.UserAgent == "" {
 		up.UserAgent = "Mozilla/5.0"
 	}
-	if up.MaxRetries <= 0 {
-		up.MaxRetries = 3
+	if up.MaxRetries < 0 {
+		up.MaxRetries = 0
 	}
 	if up.RetryBackoff <= 0 {
 		up.RetryBackoff = 200 * time.Millisecond
@@ -280,7 +280,7 @@ func (c *Client) Do(ctx context.Context, p Principal, method, path string, heade
 		}
 
 		// 服务端要求退避时，尊重它给的时长。
-		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
+		if (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable) && !noReplay && bodyReader == nil {
 			ra := parseRetryAfter(resp.Header.Get("Retry-After"))
 			drainClose(resp)
 			if attempt == c.up.MaxRetries {
@@ -322,6 +322,9 @@ type noReplayKey struct{}
 func withNoReplay(ctx context.Context) context.Context {
 	return context.WithValue(ctx, noReplayKey{}, true)
 }
+
+// WithNoReplay prevents replay after any dispatched non-idempotent request.
+func WithNoReplay(ctx context.Context) context.Context { return withNoReplay(ctx) }
 
 func isNoReplay(ctx context.Context) bool {
 	v, _ := ctx.Value(noReplayKey{}).(bool)

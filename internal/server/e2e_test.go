@@ -1788,7 +1788,7 @@ func TestE2E_APIKeyAuth_ExemptProbes(t *testing.T) {
 	})
 
 	// 匿名访问探针端点应成功（200 OK）
-	for _, path := range []string{"/healthz", "/readyz", "/metrics"} {
+	for _, path := range []string{"/healthz", "/readyz"} {
 		resp, err := http.Get(ts.URL + path)
 		if err != nil {
 			t.Fatalf("请求 %s 失败: %v", path, err)
@@ -1796,6 +1796,25 @@ func TestE2E_APIKeyAuth_ExemptProbes(t *testing.T) {
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("探针 %s 应豁免鉴权返回 200，得到 %d", path, resp.StatusCode)
+		}
+	}
+	for _, authenticated := range []bool{false, true} {
+		req, err := http.NewRequest(http.MethodGet, ts.URL+"/metrics", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := http.StatusUnauthorized
+		if authenticated {
+			req.Header.Set("Authorization", "Bearer sk-e2e-secret")
+			want = http.StatusOK
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != want {
+			t.Errorf("指标鉴权 authenticated=%v: status=%d, want=%d", authenticated, resp.StatusCode, want)
 		}
 	}
 

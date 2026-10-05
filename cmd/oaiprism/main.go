@@ -48,7 +48,7 @@ const usage = `oaiprism - OpenAI Prism 高性能反向代理
 
 示例:
   oaiprism serve -config configs/config.yaml
-  oaiprism import -cookie "__Secure-next-auth.session-token=eyJ..." -id main
+  oaiprism import -cookie "prism_oai_access_token=eyJ...; prism_session_token=..."
   oaiprism import -access-token "eyJhbGci..." -id main2
   oaiprism probe -config configs/config.yaml
   oaiprism capture-summary -file captures/capture-2026-09-16.jsonl
@@ -254,7 +254,7 @@ func cmdImport(args []string) error {
 	fs := flag.NewFlagSet("import", flag.ExitOnError)
 	cfgPath := fs.String("config", "configs/config.yaml", "配置文件路径")
 	out := fs.String("out", "", "凭据文件输出路径（默认取配置里的 creds.file）")
-	id := fs.String("id", "main", "账号 ID")
+	id := fs.String("id", "", "账号 ID（默认按登录身份自动生成，避免覆盖其他账号）")
 	name := fs.String("name", "", "账号显示名")
 	cookie := fs.String("cookie", "", "浏览器完整 Cookie 串")
 	sessionToken := fs.String("session-token", "", "只给 session-token 的值")
@@ -266,6 +266,9 @@ func cmdImport(args []string) error {
 	stdin := fs.Bool("stdin", false, "从标准输入读取 Cookie 串（避免 shell 历史泄漏）")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *maxConc < 0 {
+		return fmt.Errorf("最大并发数不能为负数")
 	}
 
 	if *stdin {
@@ -304,8 +307,7 @@ func cmdImport(args []string) error {
 
 	existing, err := store.Load()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "警告: 现有凭据文件解析失败，将被覆盖: %v\n", err)
-		existing = nil
+		return fmt.Errorf("现有凭据文件解析失败，已保留原文件: %w", err)
 	}
 
 	ac := config.AccountConfig{
@@ -318,9 +320,6 @@ func cmdImport(args []string) error {
 		Proxy:          *proxy,
 		MaxConcurrency: *maxConc,
 	}
-	if ac.Name == "" {
-		ac.Name = ac.ID
-	}
 
 	c := creds.FromAccountConfig(ac)
 
@@ -328,10 +327,11 @@ func cmdImport(args []string) error {
 	// 这一步同时完成三件事：验证凭据、补全元信息、拿到 refresh_token（如果有）。
 	if !*skipVerify {
 		fmt.Println("正在向上游校验凭据…")
-		client, err := httpc.New(cfg.Upstream, httpc.Options{})
+		client, err := httpc.New(cfg.Upstream, httpc.Options{Proxy: *proxy})
 		if err != nil {
 			return err
 		}
+		defer client.CloseIdle()
 		up := cfg.Upstream
 		if up.UserAgent == "" {
 			up.UserAgent = config.DefaultUserAgent
@@ -349,11 +349,12 @@ func cmdImport(args []string) error {
 				"校验失败: %v\n"+
 					"提示：请确认 Cookie 完整（至少包含 %s），且是从 prism.openai.com 登录后复制的最新值。\n"+
 					"若确定抄写无误，可加 -skip-verify 先离线写入，稍后再用 probe 复查。\n",
-				rerr, creds.CookieSessionToken)
+				rerr, creds.CookiePrismAccessToken+" / "+creds.CookiePrismSessionToken)
 			return rerr
 		}
 		c = next
 		ac.AccessToken = c.AccessToken
+		ac.SessionToken = c.SessionToken
 		if c.RefreshToken != "" {
 			ac.RefreshToken = c.RefreshToken
 		}
@@ -376,6 +377,20 @@ func cmdImport(args []string) error {
 		}
 	}
 
+	ac.ID, err = account.ResolveImportID(ac, c, existing)
+	if err != nil {
+		return err
+	}
+	if ac.Name == "" {
+		ac.Name = c.Email
+		if ac.Name == "" {
+			ac.Name = ac.ID
+		}
+	}
+	ac.Email, ac.AccountID = c.Email, c.AccountID
+	if ac.Plan == "" {
+		ac.Plan = c.Plan
+	}
 	// upsert 到凭据文件。
 	merged := make([]config.AccountConfig, 0, len(existing)+1)
 	replaced := false
@@ -394,6 +409,17 @@ func cmdImport(args []string) error {
 	if err := store.Persist(merged); err != nil {
 		return fmt.Errorf("写入凭据文件: %w", err)
 	}
+	dbPath := filepath.Join(filepath.Dir(credsPath), "accounts.db")
+	if _, err := os.Stat(dbPath); err == nil {
+		db, err := account.NewSQLiteStore(dbPath, log)
+		if err != nil {
+			return fmt.Errorf("凭据文件已保存，但 SQLite 同步失败: %w", err)
+		}
+		defer db.Close()
+		if err := db.SaveAccount(ac); err != nil {
+			return fmt.Errorf("凭据文件已保存，但 SQLite 同步失败: %w", err)
+		}
+	}
 
 	fmt.Printf("\n已写入 %s（共 %d 个账号，本次为%s）\n", credsPath, len(merged),
 		map[bool]string{true: "更新", false: "新增"}[replaced])
@@ -408,7 +434,7 @@ func canRefreshDesc(c *creds.Credential) string {
 	}
 	switch {
 	case c.RefreshToken != "":
-		return "有 refresh_token —— 可无限自动续期（最稳）"
+		return "有 refresh_token —— 有效期间可自动续期；被撤销后需重新登录导入"
 	case c.SessionToken != "" || creds.HasSessionCookie(c.CookieHeader):
 		return "有 session cookie —— 会话过期前可自动刷新，过期后需重新导入"
 	case c.AccessToken != "":

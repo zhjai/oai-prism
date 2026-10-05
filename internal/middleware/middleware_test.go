@@ -80,7 +80,7 @@ func TestAPIKeyAuth_ExemptProbes(t *testing.T) {
 	mw := APIKeyAuth([]string{"sk-test-key"}, nil, true)
 	handler := mw(next)
 
-	probes := []string{"/healthz", "/readyz", "/metrics"}
+	probes := []string{"/healthz", "/readyz"}
 	for _, p := range probes {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, p, nil)
@@ -88,6 +88,18 @@ func TestAPIKeyAuth_ExemptProbes(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Errorf("探针 %s 应当豁免鉴权，得到状态码 %d", p, rec.Code)
 		}
+	}
+	metrics := httptest.NewRecorder()
+	handler.ServeHTTP(metrics, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if metrics.Code != http.StatusUnauthorized {
+		t.Errorf("匿名指标请求应返回 401，得到 %d", metrics.Code)
+	}
+	metricsAuth := httptest.NewRecorder()
+	metricsReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	metricsReq.Header.Set("Authorization", "Bearer sk-test-key")
+	handler.ServeHTTP(metricsAuth, metricsReq)
+	if metricsAuth.Code != http.StatusOK {
+		t.Errorf("已鉴权指标请求应返回 200，得到 %d", metricsAuth.Code)
 	}
 
 	// 业务端点没有 key 应被 401 拦截

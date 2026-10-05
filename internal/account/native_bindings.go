@@ -65,6 +65,20 @@ func (s *SQLiteStore) DeleteNativeBinding(key string) error {
 	return err
 }
 
+// PruneNativeBindings removes bindings last updated before since.
+func (s *SQLiteStore) PruneNativeBindings(since time.Time) error {
+	if s == nil {
+		return errSQLiteUnavailable
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db == nil {
+		return errSQLiteUnavailable
+	}
+	_, err := s.db.Exec(`DELETE FROM native_bindings WHERE updated_at < ?`, since.Unix())
+	return err
+}
+
 // LoadNativeBindings 读出 since 之后更新过的绑定，并清掉更早的。
 func (s *SQLiteStore) LoadNativeBindings(since time.Time) ([]NativeBindingRecord, error) {
 	if s == nil {

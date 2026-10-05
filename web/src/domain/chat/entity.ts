@@ -52,6 +52,8 @@ export interface ChatSession {
 
 export interface SendMessageOptions {
   sessionId: string;
+  userMessageId: string;
+  assistantMessageId: string;
   content: string;
   attachments?: ChatAttachment[];
   model: string;

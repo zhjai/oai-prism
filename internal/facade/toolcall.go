@@ -104,7 +104,7 @@ func planDeltaFile(f prism.CodexDeltaFile) (fileEdit, error) {
 			break
 		}
 	}
-	if whole && (f.Status == "added" || len(hunks) == 1) {
+	if whole && f.Status == "added" {
 		var sb strings.Builder
 		for _, h := range hunks {
 			sb.WriteString(h.New)
@@ -406,8 +406,8 @@ func MapDeltaFilesToToolCalls(files []prism.CodexDeltaFile, declaredTools []Chat
 // ApplyLocalWorkspaceFiles 直接将 DeltaFiles 落到网关所在机器的工作区目录。
 //
 // 只应在 facade.local_workspace_write 开启且请求来自本机时调用（见 chat.go）。
-// 路径经 safeRelPath 校验，并用 filepath.Rel 二次确认落点在工作区内 ——
-// 早期用字符串前缀判断，"<root>-evil" 这类兄弟目录能直接绕过。
+// Paths are validated syntactically, then resolved through os.Root so symlinks
+// cannot redirect file operations outside the workspace.
 // 返回第一个错误，但会尽量处理完其余文件。
 func ApplyLocalWorkspaceFiles(workspaceRoot string, files []prism.CodexDeltaFile) error {
 	if workspaceRoot == "" || len(files) == 0 {
@@ -418,9 +418,11 @@ func ApplyLocalWorkspaceFiles(workspaceRoot string, files []prism.CodexDeltaFile
 	if err != nil {
 		return fmt.Errorf("无效的本地工作区路径: %w", err)
 	}
-	if err := ValidateWorkspaceExists(root); err != nil {
+	workspace, err := os.OpenRoot(root)
+	if err != nil {
 		return err
 	}
+	defer workspace.Close()
 
 	var firstErr error
 	keep := func(e error) {
@@ -437,27 +439,23 @@ func ApplyLocalWorkspaceFiles(workspaceRoot string, files []prism.CodexDeltaFile
 			keep(fmt.Errorf("%s: %w", f.FilePath, err))
 			continue
 		}
-		target := filepath.Join(root, filepath.FromSlash(plan.Path))
-		if rel, err := filepath.Rel(root, target); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			keep(fmt.Errorf("非法路径越界: %s", f.FilePath))
-			continue
-		}
+		target := filepath.FromSlash(plan.Path)
 
 		switch plan.Kind {
 		case editDelete:
-			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+			if err := workspace.Remove(target); err != nil && !os.IsNotExist(err) {
 				keep(err)
 			}
 		case editWrite:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			if err := workspace.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				keep(fmt.Errorf("创建目录失败 (%s): %w", filepath.Dir(target), err))
 				continue
 			}
-			if err := os.WriteFile(target, []byte(plan.Content), 0o644); err != nil {
+			if err := workspace.WriteFile(target, []byte(plan.Content), 0o644); err != nil {
 				keep(fmt.Errorf("写入本地文件失败 (%s): %w", target, err))
 			}
 		case editPatch:
-			cur, err := os.ReadFile(target)
+			cur, err := workspace.ReadFile(target)
 			if err != nil {
 				keep(fmt.Errorf("读取待修改文件失败 (%s): %w", target, err))
 				continue
@@ -467,7 +465,7 @@ func ApplyLocalWorkspaceFiles(workspaceRoot string, files []prism.CodexDeltaFile
 				keep(fmt.Errorf("%s: %w", plan.Path, err))
 				continue
 			}
-			if err := os.WriteFile(target, []byte(next), 0o644); err != nil {
+			if err := workspace.WriteFile(target, []byte(next), 0o644); err != nil {
 				keep(fmt.Errorf("写入本地文件失败 (%s): %w", target, err))
 			}
 		}

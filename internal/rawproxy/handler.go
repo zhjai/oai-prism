@@ -148,12 +148,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		// 客户端的认证信息一律丢弃，换成池里账号的。
 		// 这一步是安全边界：否则调用方可以用自己的 cookie 覆盖账号池。
-		if lk == "authorization" || lk == "cookie" {
+		if lk == "authorization" || lk == "cookie" || lk == "x-api-key" || lk == "api-key" || strings.HasPrefix(lk, "x-oaiprism-") || lk == "x-local-workspace" {
 			continue
 		}
 		for _, vv := range v {
 			hdr.Add(k, vv)
 		}
+	}
+	for _, name := range h.cfg.RawProxy.StripHeaders {
+		hdr.Del(name)
 	}
 	h.setCredentials(hdr, cred)
 
@@ -161,6 +164,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p := prism.Principal{Client: acct.Client, Cred: cred, ExtraHeaders: nil, AccountID: acct.ID}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
+		ctx = prism.WithNoReplay(ctx)
+	}
 
 	resp, err := h.client.Do(ctx, p, r.Method, upstreamPath, hdr, body, nil)
 	if err != nil {

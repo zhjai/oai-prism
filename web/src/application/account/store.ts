@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { AccountStats, AccountImportInput, AdminRefreshResponse } from '../../domain/account/entity';
+import type { AccountConfig, AccountStats, AccountImportInput, AdminRefreshResponse } from '../../domain/account/entity';
 import { LocalAccountRepositoryImpl } from '../../infrastructure/repositories/account.repo.impl';
 
 const repo = new LocalAccountRepositoryImpl();
@@ -120,42 +120,51 @@ export const useAccountStore = create<AccountState>((set, get) => ({
   },
 
   importAccounts: async (input: AccountImportInput) => {
-    const text = input.rawText.trim();
-    if (!text) throw new Error('导入内容不能为空');
+    let batch: AccountConfig[];
+    if (input.accounts) {
+      batch = input.accounts;
+    } else {
+      const text = input.rawText.trim();
+      if (!text) throw new Error('导入内容不能为空');
 
-    const batch: any[] = [];
-    if (text.startsWith('{') || text.startsWith('[')) {
+      let parsed: unknown;
       try {
-        const parsed = JSON.parse(text);
-        const list = Array.isArray(parsed) ? parsed : [parsed];
-        for (const item of list) {
-          batch.push({
-            id: item.id || `acc_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-            name: item.name || item.id || '新建账号',
-            plan: item.plan || 'pro',
-            email: item.email || '',
-            cookies: item.cookies || item.cookie || '',
-            access_token: item.accessToken || item.access_token || '',
-            refresh_token: item.refreshToken || item.refresh_token || '',
-            max_concurrency: item.maxConcurrency ?? item.max_concurrency ?? 2,
-          });
-        }
+        parsed = JSON.parse(text);
       } catch {
-        // 尝试按行解析
+        if (/^[{["]/.test(text)) {
+          throw new Error('JSON 格式无效，请修正后重新导入');
+        }
       }
-    }
 
-    if (batch.length === 0) {
-      const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
-      for (const line of lines) {
-        const id = `acc_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-        batch.push({
-          id,
-          name: input.name ? `${input.name} (${id.slice(-4)})` : `Cookie账号 #${id.slice(-4)}`,
-          plan: 'pro',
-          cookies: line,
-          max_concurrency: 2,
+      if (parsed !== undefined) {
+        const wrapped = parsed && typeof parsed === 'object' && !Array.isArray(parsed) && 'accounts' in parsed;
+        const list = wrapped ? (parsed as { accounts: unknown }).accounts : Array.isArray(parsed) ? parsed : [parsed];
+        if (!Array.isArray(list)) throw new Error('accounts 必须是账号数组');
+        batch = list.map((value: unknown) => {
+          if (!value || typeof value !== 'object' || Array.isArray(value)) {
+            throw new Error('每个账号必须是 JSON 对象');
+          }
+          const item = value as Record<string, unknown>;
+          return {
+            ...item,
+            name: item.name ?? item.id ?? '新建账号',
+            cookies: item.cookies ?? item.cookie,
+            session_token: item.session_token ?? item.sessionToken,
+            access_token: item.access_token ?? item.accessToken,
+            refresh_token: item.refresh_token ?? item.refreshToken,
+            max_concurrency: item.max_concurrency ?? item.maxConcurrency ?? 2,
+          } as AccountConfig;
         });
+      } else {
+        const lines = text.split('\n').map((line) => line.trim()).filter(Boolean);
+        if (lines.some((line) => !line.includes('='))) {
+          throw new Error('Cookie 格式无效，请输入完整的 name=value Cookie 或有效 JSON');
+        }
+        batch = lines.map((cookies, index) => ({
+          name: input.name || `Cookie账号 #${index + 1}`,
+          cookies,
+          max_concurrency: 2,
+        }));
       }
     }
 
@@ -163,7 +172,13 @@ export const useAccountStore = create<AccountState>((set, get) => ({
       throw new Error('未能识别出有效的账号凭据内容');
     }
 
-    await get().createAccount(batch);
+    set({ loading: true });
+    try {
+      await repo.importAccounts(batch, input.verify ?? true);
+      await get().fetchAccounts();
+    } finally {
+      set({ loading: false });
+    }
   },
 
   openDetailDrawer: (account: AccountStats) => {

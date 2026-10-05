@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/oai-prism/oaiprism/internal/account"
+	"golang.org/x/time/rate"
 )
 
 // dynamicKeys 缓存 Dashboard 签发、持久化在 SQLite 里的 API Key。
@@ -78,13 +79,39 @@ func (d *dynamicKeys) Invalidate() {
 
 // adminSessions 是 /admin/login 签发的管理会话令牌（内存态，重启即失效）。
 type adminSessions struct {
-	ttl time.Duration
-	mu  sync.Mutex
-	m   map[string]time.Time
+	ttl   time.Duration
+	mu    sync.Mutex
+	m     map[string]time.Time
+	login map[string]*loginBucket
+}
+
+type loginBucket struct {
+	limiter *rate.Limiter
+	seen    time.Time
 }
 
 func newAdminSessions() *adminSessions {
-	return &adminSessions{ttl: 12 * time.Hour, m: make(map[string]time.Time)}
+	return &adminSessions{ttl: 12 * time.Hour, m: make(map[string]time.Time), login: make(map[string]*loginBucket)}
+}
+
+func (a *adminSessions) allowLogin(peer string, now time.Time) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for key, bucket := range a.login {
+		if now.Sub(bucket.seen) > 10*time.Minute {
+			delete(a.login, key)
+		}
+	}
+	bucket := a.login[peer]
+	if bucket == nil {
+		if len(a.login) >= 4096 {
+			return false
+		}
+		bucket = &loginBucket{limiter: rate.NewLimiter(rate.Every(10*time.Second), 5)}
+		a.login[peer] = bucket
+	}
+	bucket.seen = now
+	return bucket.limiter.AllowN(now, 1)
 }
 
 // Issue 签发一个随机令牌。
@@ -130,6 +157,15 @@ func (a *adminSessions) Valid(tok string) bool {
 // 管理接口校验它 —— 登录形同虚设。现在密码只来自配置（server.admin_password
 // 或 OAI_PRISM_ADMIN_PASSWORD），未配置时不开放密码登录。
 func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
+	peer, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		peer = r.RemoteAddr
+	}
+	if !s.admins.allowLogin(peer, time.Now()) {
+		w.Header().Set("Retry-After", "10")
+		writeAdminErr(w, http.StatusTooManyRequests, "登录尝试过于频繁，请稍后重试")
+		return
+	}
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -150,8 +186,6 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	okUser := subtle.ConstantTimeCompare([]byte(req.Username), []byte(user)) == 1
 	okPass := subtle.ConstantTimeCompare([]byte(req.Password), []byte(want)) == 1
 	if !okUser || !okPass {
-		// 固定延迟，拖慢在线爆破。
-		time.Sleep(time.Second)
 		writeAdminErr(w, http.StatusUnauthorized, "账号或密码错误")
 		return
 	}

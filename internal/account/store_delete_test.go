@@ -112,3 +112,47 @@ func TestStore_DeleteDuringWatch(t *testing.T) {
 		t.Fatal("watcher overwrote deletion in the store cache")
 	}
 }
+
+func TestStore_PersistPreservesMetadataAndUntouchedAccounts(t *testing.T) {
+	for _, wrapped := range []bool{false, true} {
+		raw := `[{"id":"a","accessToken":"old","unknown":{"a":1}},{"id":"b","access-token":"kept","custom":true}]`
+		if wrapped {
+			raw = `{"metadata":{"version":8},"accounts":` + raw + `}`
+		}
+		path := filepath.Join(t.TempDir(), "accounts.json")
+		if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		s := NewStore(path, nopLog())
+		list, err := s.Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		list[0].AccessToken = "new"
+		list = append(list, config.AccountConfig{ID: "c", AccessToken: "added"})
+		if err := s.Persist(list); err != nil {
+			t.Fatal(err)
+		}
+		out, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var entries []map[string]json.RawMessage
+		if wrapped {
+			var doc map[string]json.RawMessage
+			if json.Unmarshal(out, &doc) != nil || string(doc["metadata"]) == "" {
+				t.Fatal("wrapper metadata lost")
+			}
+			out = doc["accounts"]
+		}
+		if json.Unmarshal(out, &entries) != nil || len(entries) != 3 {
+			t.Fatal("invalid persisted document")
+		}
+		if string(entries[0]["access_token"]) != `"new"` || entries[0]["accessToken"] != nil || entries[0]["unknown"] == nil {
+			t.Fatal("updated account lost metadata or retained stale token alias")
+		}
+		if string(entries[1]["access-token"]) != `"kept"` || string(entries[1]["custom"]) != "true" {
+			t.Fatal("untouched entry was rewritten")
+		}
+	}
+}

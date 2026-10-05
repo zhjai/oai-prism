@@ -5,6 +5,8 @@ import { ChatRepositoryImpl } from '../../infrastructure/repositories/chat.repo.
 
 const repo = new ChatRepositoryImpl();
 
+const newId = (prefix: string) => `${prefix}_${Array.from(crypto.getRandomValues(new Uint32Array(4)), (part) => part.toString(16).padStart(8, '0')).join('')}`;
+
 interface ChatState {
   models: ChatModelInfo[];
   allModelIds: string[]; // 全量 id（含档位变体）—— 推导各模型的可用推理档位
@@ -65,7 +67,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   createNewSession: () => {
     const newSession: ChatSession = {
-      id: `sess_${Date.now()}`,
+      id: newId('sess'),
       title: '新调试会话',
       model: get().selectedModel,
       reasoningEffort: get().reasoningEffort,
@@ -121,13 +123,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   sendMessage: async (text: string, attachments?: ChatAttachment[]) => {
     const { currentSessionId, selectedModel, reasoningEffort, selectedAccountId, sessions } = get();
-    if (!text.trim() || !currentSessionId) return;
+    if (!text.trim() || !currentSessionId || get().isStreaming) return;
 
     const session = sessions.find((s) => s.id === currentSessionId);
     if (!session) return;
 
     const userMsg: ChatMessage = {
-      id: `msg_${Date.now()}_u`,
+      id: newId('msg_u'),
       role: 'user',
       content: text,
       attachments: attachments && attachments.length > 0 ? attachments : undefined,
@@ -135,7 +137,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       status: 'success',
     };
 
-    const assistantMsgId = `msg_${Date.now()}_a`;
+    const assistantMsgId = newId('msg_a');
     const assistantMsg: ChatMessage = {
       id: assistantMsgId,
       role: 'assistant',
@@ -154,13 +156,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
     };
 
     const updatedSessions = sessions.map((s) => (s.id === currentSessionId ? updatedSession : s));
-    set({ sessions: updatedSessions, isStreaming: true });
+    set({ sessions: updatedSessions, isStreaming: true, lastUsage: null });
 
     let currentContent = '';
     let currentReasoning = '';
 
     await repo.sendMessageStream({
       sessionId: currentSessionId,
+      userMessageId: userMsg.id,
+      assistantMessageId: assistantMsgId,
       content: text,
       attachments,
       model: selectedModel,
@@ -196,7 +200,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             if (m.id !== assistantMsgId) return m;
             return {
               ...m,
-              content: currentContent || '（已完成响应）',
+              content: currentContent,
               reasoning: currentReasoning,
               status: 'success' as const,
             };
@@ -214,7 +218,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
             if (m.id !== assistantMsgId) return m;
             return {
               ...m,
-              content: `[请求失败] ${err.message}`,
+              content: `${currentContent ? currentContent + '\n\n' : ''}[请求失败] ${err.message}`,
+              reasoning: currentReasoning,
               status: 'error' as const,
             };
           });

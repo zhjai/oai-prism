@@ -63,6 +63,7 @@ type LogErrorBox struct {
 	mu      sync.Mutex
 	msgs    []string
 	account string
+	model   string
 	// 本次请求的 token 用量（facade 按实际收发内容精确计数后写入）
 	promptTokens, completionTokens int
 }
@@ -105,6 +106,23 @@ func LogAccount(ctx context.Context) string {
 		box.mu.Lock()
 		defer box.mu.Unlock()
 		return box.account
+	}
+	return ""
+}
+
+func RecordLogModel(r *http.Request, model string) {
+	if box, ok := r.Context().Value(CtxKeyLogError{}).(*LogErrorBox); ok {
+		box.mu.Lock()
+		box.model = model
+		box.mu.Unlock()
+	}
+}
+
+func LogModel(ctx context.Context) string {
+	if box, ok := ctx.Value(CtxKeyLogError{}).(*LogErrorBox); ok {
+		box.mu.Lock()
+		defer box.mu.Unlock()
+		return box.model
 	}
 	return ""
 }
@@ -198,7 +216,7 @@ func CORS(origin string) Middleware {
 	if origin == "" {
 		return func(next http.Handler) http.Handler { return next }
 	}
-	allowHeaders := "authorization, content-type, x-prism-conversation-id, x-oaiprism-session, x-oaiprism-previous"
+	allowHeaders := "authorization, content-type, x-api-key, api-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access, x-prism-conversation-id, x-oaiprism-session, x-oaiprism-previous, x-oaiprism-account, x-local-workspace"
 	// Expose-Headers 是关键：自定义响应头（尤其是 x-prism-conversation-id）
 	// 不在 CORS 安全列表里，浏览器默认不给 JS 读。少了它，跨域客户端
 	// 拿不到会话 ID，多轮续写直接断链 —— 而且不报错，只是"每次都是新会话"。
@@ -208,7 +226,7 @@ func CORS(origin string) Middleware {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Headers", allowHeaders)
 			w.Header().Set("Access-Control-Expose-Headers", exposeHeaders)
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 			if r.Method == http.MethodOptions {
 				w.WriteHeader(http.StatusNoContent)
 				return
@@ -309,6 +327,8 @@ func MetricsMiddleware(app *metrics.App) Middleware {
 			}
 			path := routeLabel(r.URL.Path)
 			start := time.Now()
+			app.HTTPInflight.With(path).Add(1)
+			defer app.HTTPInflight.With(path).Add(-1)
 
 			rec := &statusRecorder{ResponseWriter: w}
 			if f, ok := w.(http.Flusher); ok {
@@ -352,7 +372,14 @@ func routeLabel(p string) string {
 	case strings.HasPrefix(p, "/metrics"):
 		return "/metrics"
 	case strings.HasPrefix(p, "/admin/"):
-		return p
+		segments := strings.Split(strings.Trim(p, "/"), "/")
+		for i := 2; i < len(segments); i++ {
+			if (i == 2 && segments[1] == "chat" && segments[i] == "sessions") || (i == len(segments)-1 && (segments[i] == "bindings" || segments[i] == "refresh" || segments[i] == "messages")) {
+				continue
+			}
+			segments[i] = "{id}"
+		}
+		return "/" + strings.Join(segments, "/")
 	}
 	// 原样反代通道：按最后两段归类，保留端点语义但去掉 UUID。
 	segs := strings.Split(strings.Trim(p, "/"), "/")
@@ -452,7 +479,7 @@ type AuthOptions struct {
 //
 // 比较一律 constant-time。
 func Auth(o AuthOptions) Middleware {
-	exempt := map[string]struct{}{"/healthz": {}, "/readyz": {}, "/metrics": {}}
+	exempt := map[string]struct{}{"/healthz": {}, "/readyz": {}}
 	for _, p := range o.ExemptPaths {
 		if p = strings.TrimSpace(p); p != "" {
 			exempt[p] = struct{}{}

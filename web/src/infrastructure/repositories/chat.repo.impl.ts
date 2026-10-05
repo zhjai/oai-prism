@@ -102,10 +102,10 @@ export class ChatRepositoryImpl implements IChatRepository {
               return {
                 id: m.id,
                 role: m.role,
-                content,
+                content: m.status === 'loading' ? `${content ? content + '\n\n' : ''}[请求失败] 响应未确认完成，请重新发送` : content,
                 attachments,
                 reasoning: m.reasoning || '',
-                status: m.status || 'success',
+                status: m.status === 'loading' ? 'error' : m.status || 'success',
                 createdAt: m.created_at || new Date().toISOString(),
               };
             });
@@ -168,12 +168,13 @@ export class ChatRepositoryImpl implements IChatRepository {
    *  - 纯文本字符串：直接用；
    *  - 入库的多模态 JSON 串（persistContent 以 JSON.stringify 存储）：解析回内容块数组；
    *  - 内存态带 attachments 的 user 消息：重建成 text + image_url 块。
-   * 失败轮（空内容/loading 占位）不上屏 —— 空回复会污染上下文。
+   * 失败与未完成的消息不参与下一轮上下文。
    */
   private toApiMessages(history: ChatMessage[] | undefined, userContent: any): any[] {
     const msgs: any[] = [];
     for (const m of history ?? []) {
-      if (m.status === 'loading') continue;
+      if (m.status === 'loading' || m.status === 'error') continue;
+      if (m.role === 'assistant' && m.status !== 'success') continue;
       if (!m.content || !m.content.trim()) continue;
       let content: any = m.content;
       if (content.startsWith('[{')) {
@@ -196,7 +197,24 @@ export class ChatRepositoryImpl implements IChatRepository {
   }
 
   async sendMessageStream(options: SendMessageOptions): Promise<void> {
-    const { sessionId, model, reasoningEffort, accountId, content, attachments, history, onChunk, onUsage, onError, onFinish } = options;
+    const { sessionId, userMessageId, assistantMessageId, model, reasoningEffort, accountId, content, attachments, history, onChunk, onUsage, onError, onFinish } = options;
+    const messagePath = `/admin/chat/sessions/${encodeURIComponent(sessionId)}/messages`;
+    let fullAssistantText = '';
+    let fullAssistantReasoning = '';
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    const saveAssistant = async (status: 'loading' | 'success' | 'error', failure?: string) => {
+      try {
+        await httpClient.post(messagePath, {
+          id: assistantMessageId,
+          role: 'assistant',
+          content: failure ? `${fullAssistantText ? fullAssistantText + '\n\n' : ''}[请求失败] ${failure}` : fullAssistantText,
+          reasoning: fullAssistantReasoning,
+          status,
+        });
+      } catch {
+        throw new Error('回复记录保存失败，请检查存储连接');
+      }
+    };
 
     try {
       // 组装 OpenAI 多模态消息：无附件 = 纯字符串；有附件 = text + image_url 内容块
@@ -210,13 +228,17 @@ export class ChatRepositoryImpl implements IChatRepository {
       const persistContent = typeof userContent === 'string' ? userContent : JSON.stringify(userContent);
 
       // 1. 先将用户消息持久化入库（多模态内容以 JSON 串存储，读取端解析）
-      const userMsgId = `msg_u_${Date.now()}`;
-      await httpClient.post(`/admin/chat/sessions/${sessionId}/messages`, {
-        id: userMsgId,
-        role: 'user',
-        content: persistContent,
-        status: 'success',
-      }).catch(() => {});
+      try {
+        await httpClient.post(messagePath, {
+          id: userMessageId,
+          role: 'user',
+          content: persistContent,
+          status: 'success',
+        });
+      } catch {
+        throw new Error('用户消息保存失败，请检查存储连接');
+      }
+      await saveAssistant('loading');
 
       // 2. 发起流式推理请求
       const response = await fetch('/v1/chat/completions', {
@@ -244,95 +266,90 @@ export class ChatRepositoryImpl implements IChatRepository {
         throw new Error(`上游响应失败 (${response.status}): ${errText}`);
       }
 
-      const reader = response.body?.getReader();
+      reader = response.body?.getReader();
       if (!reader) {
         throw new Error('当前浏览器环境不支持 ReadableStream');
       }
 
       const decoder = new TextDecoder('utf-8');
       let buffer = '';
-      let fullAssistantText = '';
-      let fullAssistantReasoning = '';
+      let eventData: string[] = [];
+      let completed = false;
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || !trimmed.startsWith('data:')) continue;
-          const dataStr = trimmed.replace(/^data:\s*/, '').trim();
-          if (dataStr === '[DONE]') {
-            // 将 assistant 回复持久化入库
-            await httpClient.post(`/admin/chat/sessions/${sessionId}/messages`, {
-              id: `msg_a_${Date.now()}`,
-              role: 'assistant',
-              content: fullAssistantText,
-              reasoning: fullAssistantReasoning,
-              status: 'success',
-            }).catch(() => {});
-
-            onFinish?.();
-            return;
-          }
-
-          try {
-            const parsed = JSON.parse(dataStr);
-            // The gateway reports failures after HTTP 200 as SSE error payloads.
-            // Treat them as failures before [DONE] can mark an empty run successful.
-            if (parsed.error) {
-              const err = new Error(parsed.error.message || '上游请求失败');
-              await httpClient.post(`/admin/chat/sessions/${sessionId}/messages`, {
-                id: `msg_a_${Date.now()}`,
-                role: 'assistant',
-                content: `[请求失败] ${err.message}`,
-                status: 'error',
-              }).catch(() => {});
-              onError?.(err);
-              await reader.cancel();
-              return;
-            }
-            // include_usage 的收尾帧：choices 为空、只带 usage
-            if (parsed.usage && (!parsed.choices || parsed.choices.length === 0)) {
-              onUsage?.({
-                promptTokens: parsed.usage.prompt_tokens || 0,
-                completionTokens: parsed.usage.completion_tokens || 0,
-                totalTokens: parsed.usage.total_tokens || 0,
-              });
-              continue;
-            }
-            const delta = parsed.choices?.[0]?.delta;
-            if (delta) {
-              const textChunk = delta.content || '';
-              const reasoningChunk = delta.reasoning_content || delta.reasoning || '';
-              fullAssistantText += textChunk;
-              fullAssistantReasoning += reasoningChunk;
-              onChunk?.(textChunk, reasoningChunk);
-            }
-          } catch {
-            // 忽略非 JSON 行
-          }
+      const consumeEvent = () => {
+        if (eventData.length === 0) return;
+        const dataStr = eventData.join('\n').trim();
+        eventData = [];
+        if (dataStr === '[DONE]') {
+          completed = true;
+          return;
         }
+        let parsed;
+        try {
+          parsed = JSON.parse(dataStr);
+        } catch {
+          throw new Error('上游返回了无效的流式数据');
+        }
+        if (!parsed || typeof parsed !== 'object') throw new Error('上游返回了无效的流式数据');
+        if (parsed.error) {
+          throw new Error(typeof parsed.error === 'string' ? parsed.error : parsed.error.message || '上游请求失败');
+        }
+        if (parsed.usage) {
+          onUsage?.({
+            promptTokens: parsed.usage.prompt_tokens || 0,
+            completionTokens: parsed.usage.completion_tokens || 0,
+            totalTokens: parsed.usage.total_tokens || 0,
+          });
+        }
+        const delta = parsed.choices?.[0]?.delta;
+        if (delta) {
+          const textChunk = delta.content || '';
+          const reasoningChunk = delta.reasoning_content || delta.reasoning || '';
+          fullAssistantText += textChunk;
+          fullAssistantReasoning += reasoningChunk;
+          onChunk?.(textChunk, reasoningChunk);
+        }
+      };
+
+      const consumeLine = (line: string) => {
+        if (line === '') consumeEvent();
+        else if (line.startsWith('data:')) eventData.push(line.slice(5).replace(/^ /, ''));
+      };
+
+      while (!completed) {
+        const { done, value } = await reader.read();
+        buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+        let boundary: number;
+        while (!completed && (boundary = buffer.search(/[\r\n]/)) !== -1) {
+          if (!done && buffer[boundary] === '\r' && boundary === buffer.length - 1) break;
+          const line = buffer.slice(0, boundary);
+          const separatorLength = buffer.slice(boundary, boundary + 2) === '\r\n' ? 2 : 1;
+          buffer = buffer.slice(boundary + separatorLength);
+          consumeLine(line);
+        }
+        if (done) break;
       }
 
-      // 如果流自然结束但没有收到 [DONE]
-      if (fullAssistantText || fullAssistantReasoning) {
-        await httpClient.post(`/admin/chat/sessions/${sessionId}/messages`, {
-          id: `msg_a_${Date.now()}`,
-          role: 'assistant',
-          content: fullAssistantText,
-          reasoning: fullAssistantReasoning,
-          status: 'success',
-        }).catch(() => {});
-      }
-
+      if (!completed) throw new Error('响应流提前结束，未收到 [DONE] 完成标记');
+      await saveAssistant('success');
       onFinish?.();
-    } catch (err: any) {
-      onError?.(err instanceof Error ? err : new Error(String(err)));
+    } catch (err: unknown) {
+      let failure = err instanceof Error ? err : new Error(String(err));
+      try {
+        await saveAssistant('error', failure.message);
+      } catch {
+        failure = new Error(`${failure.message}；失败记录未能保存，请检查存储连接`);
+      }
+      onError?.(failure);
+    } finally {
+      if (reader) {
+        try {
+          await reader.cancel();
+        } catch {
+          // A stream that already failed can reject cancellation too.
+        }
+        reader.releaseLock();
+      }
     }
   }
 }

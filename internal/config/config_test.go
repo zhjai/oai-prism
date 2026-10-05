@@ -3,7 +3,46 @@ package config
 import (
 	"os"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
+
+func TestShippedExampleParses(t *testing.T) {
+	b, err := os.ReadFile("../../configs/config.example.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Default()
+	if err := yaml.Unmarshal(b, cfg); err != nil {
+		t.Fatalf("shipped example cannot be parsed: %v", err)
+	}
+	if cfg.RequestLogs.MaxAge != 0 {
+		t.Fatal("example must retain existing request logs by default")
+	}
+}
+
+func TestApplyEnv_MergesCredentialsForOneAccount(t *testing.T) {
+	t.Setenv("OAI_PRISM_COOKIE", "prism_session_token=synthetic")
+	t.Setenv("OAI_PRISM_ACCESS_TOKEN", "access")
+	t.Setenv("OAI_PRISM_REFRESH_TOKEN", "refresh")
+	cfg := Default()
+	applyEnv(cfg)
+	if len(cfg.Creds.Accounts) != 1 {
+		t.Fatal("environment credentials created duplicate accounts")
+	}
+	a := cfg.Creds.Accounts[0]
+	if a.AccessToken != "access" || a.RefreshToken != "refresh" || a.Cookies == "" {
+		t.Fatal("environment fields were lost")
+	}
+}
+
+func TestServerAddr_IPv6(t *testing.T) {
+	for _, host := range []string{"::1", "[::1]"} {
+		if got := (ServerConfig{Host: host, Port: 8787}).Addr(); got != "[::1]:8787" {
+			t.Fatalf("invalid IPv6 address %q", got)
+		}
+	}
+}
 
 func TestApplyEnv_Aliases(t *testing.T) {
 	os.Setenv("PORT", "19090")

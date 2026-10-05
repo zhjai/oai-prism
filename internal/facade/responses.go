@@ -284,8 +284,7 @@ func isCodexAuxRequest(r *http.Request, raw map[string]json.RawMessage, bridge, 
 	if strings.Contains(ua, "codex") {
 		return true
 	}
-	_, hasCM := raw["client_metadata"]
-	return hasCM
+	return codexRequestKind(r, raw) != ""
 }
 
 // writeLocalTitle 本地生成 Codex 任务标题并按请求形态（流式/同步）回包。
@@ -495,10 +494,6 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 			js = h.bridgeExecJS(r, turn, text, res)
 		}
 
-		finalRespID := id
-		if res != nil && res.ResponseID != "" {
-			finalRespID = res.ResponseID
-		}
 		if js != "" {
 			callID := newID("ctc_")
 			var item string
@@ -530,7 +525,7 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 			}
 			done = AppendResponsesEvent(buf[:0], ResponsesEvent{
 				Type:       "response.completed",
-				ResponseID: finalRespID, Model: publicModel, CreatedAt: created,
+				ResponseID: id, Model: publicModel, CreatedAt: created,
 				OutputJSON: "[" + item + "]",
 				Usage:      usage,
 			})
@@ -539,7 +534,7 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 		}
 
 		// 纯文本：桥模式下一次性给出（模型已完整生成，无需伪增量）。
-		_ = emitTextResponseEvents(sw, &buf, finalRespID, publicModel, created, itemID, stripExecFence(text), usage)
+		_ = emitTextResponseEvents(sw, &buf, id, publicModel, created, itemID, stripExecFence(text), usage)
 		return
 	}
 
@@ -581,11 +576,7 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 		usage = res.Usage
 	}
 	// 收尾事件必须逐个发全，否则 SDK 会一直等 response.completed。
-	finalRespID := id
-	if res != nil && res.ResponseID != "" {
-		finalRespID = res.ResponseID
-	}
-	_ = emitTextResponseEvents(sw, &buf, finalRespID, publicModel, created, itemID, text, usage)
+	_ = emitTextResponseEvents(sw, &buf, id, publicModel, created, itemID, text, usage)
 }
 
 // bridgeExecJS 从桥模式回复里取出要交给客户端执行的 JS。
@@ -661,11 +652,6 @@ func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *
 		}
 	}
 
-	finalRespID := turn.id
-	if res != nil && res.ResponseID != "" {
-		finalRespID = res.ResponseID
-	}
-
 	if turn.bridge {
 		js := ""
 		if !turn.compaction {
@@ -689,7 +675,7 @@ func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *
 				}
 			}
 			respMap := map[string]any{
-				"id": finalRespID, "object": "response", "created_at": turn.created,
+				"id": turn.id, "object": "response", "created_at": turn.created,
 				"status": "completed", "model": turn.publicModel,
 				"output": []any{out},
 			}
@@ -702,7 +688,7 @@ func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *
 		text = stripExecFence(text)
 	}
 	resp := ResponsesResponse{
-		ID:        finalRespID,
+		ID:        turn.id,
 		Object:    "response",
 		CreatedAt: turn.created,
 		Status:    "completed",

@@ -36,6 +36,7 @@ type CounterVec struct {
 	help   string
 	labels []string
 	series sync.Map // key: 拼接后的标签值 -> *Counter
+	kind   string
 }
 
 // With 取（或创建）一条时间序列。
@@ -148,7 +149,16 @@ func New() *Registry {
 func (r *Registry) Counter(name, help string, labels ...string) *CounterVec {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	v := &CounterVec{name: name, help: help, labels: labels}
+	v := &CounterVec{name: name, help: help, labels: labels, kind: "counter"}
+	r.counters = append(r.counters, v)
+	return v
+}
+
+// GaugeVec stores current values using the same atomic labeled series API.
+func (r *Registry) GaugeVec(name, help string, labels ...string) *CounterVec {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	v := &CounterVec{name: name, help: help, labels: labels, kind: "gauge"}
 	r.counters = append(r.counters, v)
 	return v
 }
@@ -232,7 +242,7 @@ func (r *Registry) Render(w io.Writer) error {
 
 	// 计数器。
 	for _, cv := range r.counters {
-		fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s counter\n", cv.name, cv.help, cv.name)
+		fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s %s\n", cv.name, cv.help, cv.name, cv.kind)
 		cv.series.Range(func(k, v any) bool {
 			fmt.Fprintf(&b, "%s%s %d\n", cv.name, formatLabels(cv.labels, k.(string)), v.(*Counter).Value())
 			return true

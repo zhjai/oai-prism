@@ -2,19 +2,23 @@ package account
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/oai-prism/oaiprism/internal/config"
+	"github.com/oai-prism/oaiprism/internal/creds"
 	_ "modernc.org/sqlite"
 )
 
@@ -40,8 +44,19 @@ func NewSQLiteStore(dbPath string, log *slog.Logger) (*SQLiteStore, error) {
 		dbPath = "secrets/accounts.db"
 	}
 	dir := filepath.Dir(dbPath)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("创建数据库目录 %s 失败: %w", dir, err)
+	}
+	file, err := os.OpenFile(dbPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("create private sqlite database: %w", err)
+	}
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("secure sqlite database: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return nil, err
 	}
 
 	db, err := sql.Open("sqlite", dbPath)
@@ -77,7 +92,7 @@ func (s *SQLiteStore) initSchema() error {
 	CREATE TABLE IF NOT EXISTS accounts (
 		id TEXT PRIMARY KEY,
 		name TEXT NOT NULL,
-		plan TEXT DEFAULT 'pro',
+		plan TEXT DEFAULT '',
 		email TEXT DEFAULT '',
 		cookies TEXT DEFAULT '',
 		access_token TEXT DEFAULT '',
@@ -150,6 +165,16 @@ func (s *SQLiteStore) initSchema() error {
 	}
 	for _, migration := range []struct{ table, column, definition string }{
 		{"accounts", "enabled", "INTEGER NOT NULL DEFAULT 1"},
+		{"accounts", "cookie_map", "TEXT NOT NULL DEFAULT 'null'"},
+		{"accounts", "session_token", "TEXT NOT NULL DEFAULT ''"},
+		{"accounts", "expires_at", "TEXT NOT NULL DEFAULT ''"},
+		{"accounts", "account_id", "TEXT NOT NULL DEFAULT ''"},
+		{"accounts", "proxy", "TEXT NOT NULL DEFAULT ''"},
+		{"accounts", "rate_per_second", "REAL NOT NULL DEFAULT 0"},
+		{"accounts", "rate_burst", "INTEGER NOT NULL DEFAULT 0"},
+		{"accounts", "weight", "INTEGER NOT NULL DEFAULT 0"},
+		{"accounts", "headers", "TEXT NOT NULL DEFAULT 'null'"},
+		{"accounts", "source_fingerprint", "TEXT NOT NULL DEFAULT ''"},
 		{"chat_sessions", "account_id", "TEXT NOT NULL DEFAULT ''"},
 		{"api_keys", "account_restricted", "INTEGER NOT NULL DEFAULT 0"},
 	} {
@@ -236,7 +261,8 @@ func (s *SQLiteStore) Load() ([]config.AccountConfig, error) {
 	}
 
 	rows, err := s.db.Query(`
-		SELECT id, name, plan, email, cookies, access_token, refresh_token, max_concurrency, tags, enabled
+		SELECT id, name, plan, email, cookies, access_token, refresh_token, max_concurrency, tags, enabled,
+		cookie_map, session_token, expires_at, account_id, proxy, rate_per_second, rate_burst, weight, headers
 		FROM accounts
 		ORDER BY updated_at DESC
 	`)
@@ -249,6 +275,7 @@ func (s *SQLiteStore) Load() ([]config.AccountConfig, error) {
 	for rows.Next() {
 		var a config.AccountConfig
 		var tagsStr string
+		var cookieMap, headers, expiresAt string
 		var enabled bool
 		err := rows.Scan(
 			&a.ID,
@@ -261,12 +288,24 @@ func (s *SQLiteStore) Load() ([]config.AccountConfig, error) {
 			&a.MaxConcurrency,
 			&tagsStr,
 			&enabled,
+			&cookieMap,
+			&a.SessionToken,
+			&expiresAt,
+			&a.AccountID,
+			&a.Proxy,
+			&a.RatePerSecond,
+			&a.RateBurst,
+			&a.Weight,
+			&headers,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("读取账号行失败: %w", err)
 		}
 		if tagsStr != "" {
 			_ = json.Unmarshal([]byte(tagsStr), &a.Tags)
+		}
+		if err := decodeAccountCredentials(&a, cookieMap, headers, expiresAt); err != nil {
+			return nil, fmt.Errorf("读取账号 %s 凭据失败: %w", a.ID, err)
 		}
 		a.Enabled = &enabled
 		list = append(list, a)
@@ -276,12 +315,278 @@ func (s *SQLiteStore) Load() ([]config.AccountConfig, error) {
 
 // SaveAccount 插入或更新单账号 (Create or Update)。
 func (s *SQLiteStore) SaveAccount(a config.AccountConfig) error {
-	return s.saveAccount(a, true)
+	return s.SaveAccounts([]config.AccountConfig{a})
 }
 
-// SaveImportedAccount never restores an account deleted through the Dashboard.
+// SaveImportedAccount reconciles a passive source without replaying unchanged
+// credentials over a refresh or clearing a Dashboard deletion tombstone.
 func (s *SQLiteStore) SaveImportedAccount(a config.AccountConfig) error {
-	return s.saveAccount(a, false)
+	if s == nil {
+		return errSQLiteUnavailable
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db == nil {
+		return errSQLiteUnavailable
+	}
+	if strings.TrimSpace(a.ID) == "" {
+		return errors.New("passive account import requires a stable ID")
+	}
+	source := config.AccountConfig{
+		Cookies: a.Cookies, CookieMap: a.CookieMap, SessionToken: a.SessionToken,
+		AccessToken: a.AccessToken, RefreshToken: a.RefreshToken, ExpiresAt: a.ExpiresAt,
+		AccountID: a.AccountID, Headers: a.Headers,
+	}
+	raw, err := json.Marshal(source)
+	if err != nil {
+		return err
+	}
+	fingerprint := fmt.Sprintf("%x", sha256.Sum256(raw))
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var deleted bool
+	if err := tx.QueryRow("SELECT EXISTS (SELECT 1 FROM deleted_accounts WHERE id = ?)", a.ID).Scan(&deleted); err != nil {
+		return err
+	}
+	if deleted {
+		return nil
+	}
+	var current config.AccountConfig
+	var cookieMap, headers, expiresAt, previous string
+	err = tx.QueryRow(`SELECT cookies, cookie_map, session_token, access_token, refresh_token,
+		expires_at, account_id, headers, source_fingerprint FROM accounts WHERE id = ?`, a.ID).Scan(
+		&current.Cookies, &cookieMap, &current.SessionToken, &current.AccessToken,
+		&current.RefreshToken, &expiresAt, &current.AccountID, &headers, &previous)
+	if errors.Is(err, sql.ErrNoRows) {
+		if err := saveAccountTx(tx, a, false); err != nil {
+			return err
+		}
+	} else {
+		if err != nil {
+			return err
+		}
+		if previous == fingerprint {
+			return nil
+		}
+		if err := decodeAccountCredentials(&current, cookieMap, headers, expiresAt); err != nil {
+			return err
+		}
+		saved, incoming := creds.FromAccountConfig(current), creds.FromAccountConfig(a)
+		preserve := previous == "" && saved.ExpiresAt.After(incoming.ExpiresAt)
+		if preserve {
+			current.AccessToken, current.RefreshToken = saved.AccessToken, saved.RefreshToken
+			current.SessionToken, current.AccountID = saved.SessionToken, saved.AccountID
+			current.ExpiresAt = &saved.ExpiresAt
+		}
+		merge := func(old, value string) string {
+			if value == "" || (preserve && old != "") {
+				return old
+			}
+			return value
+		}
+		current.Cookies = merge(current.Cookies, a.Cookies)
+		current.SessionToken = merge(current.SessionToken, a.SessionToken)
+		current.AccessToken = merge(current.AccessToken, a.AccessToken)
+		current.RefreshToken = merge(current.RefreshToken, a.RefreshToken)
+		current.AccountID = merge(current.AccountID, a.AccountID)
+		if a.CookieMap != nil && (!preserve || current.CookieMap == nil) {
+			current.CookieMap = a.CookieMap
+		}
+		if !preserve {
+			if a.ExpiresAt != nil {
+				current.ExpiresAt = a.ExpiresAt
+			} else if a.AccessToken != "" && a.AccessToken != saved.AccessToken {
+				current.ExpiresAt = nil
+				if !incoming.ExpiresAt.IsZero() {
+					current.ExpiresAt = &incoming.ExpiresAt
+				}
+			}
+		}
+		for key, value := range a.Headers {
+			if current.Headers == nil {
+				current.Headers = make(map[string]string)
+			}
+			if _, exists := current.Headers[key]; !exists || (key == "oauth_client_id" && !preserve) {
+				current.Headers[key] = value
+			}
+		}
+		encodedCookies, err := json.Marshal(current.CookieMap)
+		if err != nil {
+			return err
+		}
+		encodedHeaders, err := json.Marshal(current.Headers)
+		if err != nil {
+			return err
+		}
+		expiresAt = ""
+		if current.ExpiresAt != nil {
+			expiresAt = current.ExpiresAt.Format(time.RFC3339Nano)
+		}
+		_, err = tx.Exec(`UPDATE accounts SET cookies = ?, cookie_map = ?, session_token = ?,
+			access_token = ?, refresh_token = ?, expires_at = ?, account_id = ?, headers = ?,
+			name = CASE WHEN name = '' THEN ? ELSE name END,
+			email = CASE WHEN email = '' THEN ? ELSE email END,
+			plan = CASE WHEN plan = '' THEN ? ELSE plan END,
+			tags = CASE WHEN ? AND (tags = '' OR tags = '[]' OR tags = 'null') THEN ? ELSE tags END,
+			proxy = CASE WHEN ? AND proxy = '' THEN ? ELSE proxy END,
+			rate_per_second = CASE WHEN ? AND rate_per_second = 0 THEN ? ELSE rate_per_second END,
+			rate_burst = CASE WHEN ? AND rate_burst = 0 THEN ? ELSE rate_burst END,
+			weight = CASE WHEN ? AND weight = 0 THEN ? ELSE weight END,
+			updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+			current.Cookies, string(encodedCookies), current.SessionToken, current.AccessToken,
+			current.RefreshToken, expiresAt, current.AccountID, string(encodedHeaders),
+			a.Name, a.Email, a.Plan, previous == "", accountTagsJSON(a.Tags), previous == "", a.Proxy, previous == "", a.RatePerSecond,
+			previous == "", a.RateBurst, previous == "", a.Weight, a.ID)
+		if err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec("UPDATE accounts SET source_fingerprint = ? WHERE id = ?", fingerprint, a.ID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func decodeAccountCredentials(a *config.AccountConfig, cookieMap, headers, expiresAt string) error {
+	if err := json.Unmarshal([]byte(cookieMap), &a.CookieMap); err != nil {
+		return fmt.Errorf("invalid cookie_map: %w", err)
+	}
+	if err := json.Unmarshal([]byte(headers), &a.Headers); err != nil {
+		return fmt.Errorf("invalid headers: %w", err)
+	}
+	if expiresAt != "" {
+		t, err := time.Parse(time.RFC3339Nano, expiresAt)
+		if err != nil {
+			return fmt.Errorf("invalid expires_at: %w", err)
+		}
+		a.ExpiresAt = &t
+	}
+	return nil
+}
+
+// UpdateCredential persists a refresh only while the saved credential still
+// matches its input. It never creates rows or writes account scheduling settings.
+func (s *SQLiteStore) UpdateCredential(id string, expected, next *creds.Credential) (bool, error) {
+	if s == nil {
+		return false, errSQLiteUnavailable
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db == nil {
+		return false, errSQLiteUnavailable
+	}
+	if expected == nil || next == nil {
+		return false, errors.New("refresh credentials must not be nil")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var current config.AccountConfig
+	var cookieMap, headers, expiresAt string
+	err = tx.QueryRow(`SELECT cookies, cookie_map, session_token, access_token,
+		refresh_token, expires_at, account_id, headers FROM accounts
+		WHERE id = ? AND NOT EXISTS (SELECT 1 FROM deleted_accounts WHERE id = ?)`, id, id).Scan(
+		&current.Cookies, &cookieMap, &current.SessionToken, &current.AccessToken,
+		&current.RefreshToken, &expiresAt, &current.AccountID, &headers)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if err := decodeAccountCredentials(&current, cookieMap, headers, expiresAt); err != nil {
+		return false, err
+	}
+	saved := creds.FromAccountConfig(current)
+	if saved.AccessToken != expected.AccessToken || saved.RefreshToken != expected.RefreshToken {
+		return false, nil
+	}
+	if saved.AccessToken == "" && saved.RefreshToken == "" {
+		if saved.SessionToken != expected.SessionToken ||
+			canonicalCredentialCookies(saved.EffectiveCookie()) != canonicalCredentialCookies(expected.EffectiveCookie()) {
+			return false, nil
+		}
+	}
+
+	cookies, sessionToken := current.Cookies, current.SessionToken
+	if next.CookieHeader != expected.CookieHeader &&
+		canonicalCredentialCookies(saved.CookieHeader) == canonicalCredentialCookies(expected.CookieHeader) {
+		// A refreshed header already contains cookie_map values; retain one copy.
+		cookies, cookieMap = next.CookieHeader, "null"
+	}
+	if next.SessionToken != expected.SessionToken && saved.SessionToken == expected.SessionToken {
+		sessionToken = next.SessionToken
+	}
+	if !next.ExpiresAt.Equal(expected.ExpiresAt) && saved.ExpiresAt.Equal(expected.ExpiresAt) {
+		expiresAt = ""
+		if !next.ExpiresAt.IsZero() {
+			expiresAt = next.ExpiresAt.Format(time.RFC3339Nano)
+		}
+	}
+	accountID := current.AccountID
+	if next.AccountID != expected.AccountID && saved.AccountID == expected.AccountID {
+		accountID = next.AccountID
+	}
+	// Apply only refresh changes whose original value still matches. A Dashboard
+	// edit to an unrelated header, or the same header, wins over a stale refresh.
+	for key, oldValue := range expected.Headers {
+		newValue, exists := next.Headers[key]
+		if currentValue, present := current.Headers[key]; present && currentValue == oldValue {
+			if !exists {
+				delete(current.Headers, key)
+			} else if newValue != oldValue {
+				current.Headers[key] = newValue
+			}
+		}
+	}
+	for key, value := range next.Headers {
+		if _, existed := expected.Headers[key]; existed {
+			continue
+		}
+		if _, present := current.Headers[key]; !present {
+			if current.Headers == nil {
+				current.Headers = make(map[string]string)
+			}
+			current.Headers[key] = value
+		}
+	}
+	encodedHeaders, err := json.Marshal(current.Headers)
+	if err != nil {
+		return false, err
+	}
+	res, err := tx.Exec(`UPDATE accounts SET access_token = ?, refresh_token = ?,
+		cookies = ?, cookie_map = ?, session_token = ?, expires_at = ?, account_id = ?,
+		headers = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ? AND access_token = ? AND refresh_token = ?
+		AND NOT EXISTS (SELECT 1 FROM deleted_accounts WHERE id = ?)`,
+		next.AccessToken, next.RefreshToken, cookies, cookieMap, sessionToken, expiresAt,
+		accountID, string(encodedHeaders), id, current.AccessToken, current.RefreshToken, id)
+	if err != nil {
+		return false, err
+	}
+	count, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return count != 0, nil
+}
+
+func canonicalCredentialCookies(header string) string {
+	req := &http.Request{Header: http.Header{"Cookie": []string{header}}}
+	parts := make([]string, 0)
+	for _, cookie := range req.Cookies() {
+		parts = append(parts, cookie.Name+"="+cookie.Value)
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "; ")
 }
 
 // FilterDeletedAccounts excludes deleted static/file sources during startup.
@@ -319,7 +624,8 @@ func (s *SQLiteStore) FilterDeletedAccounts(list []config.AccountConfig) ([]conf
 	return filtered, nil
 }
 
-func (s *SQLiteStore) saveAccount(a config.AccountConfig, explicit bool) error {
+// SaveAccounts atomically saves a deliberate import, including tombstone removal.
+func (s *SQLiteStore) SaveAccounts(accounts []config.AccountConfig) error {
 	if s == nil {
 		return errSQLiteUnavailable
 	}
@@ -332,48 +638,75 @@ func (s *SQLiteStore) saveAccount(a config.AccountConfig, explicit bool) error {
 	if s.db == nil {
 		return errSQLiteUnavailable
 	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, a := range accounts {
+		if err := saveAccountTx(tx, a, true); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
 
+func saveAccountTx(tx *sql.Tx, a config.AccountConfig, explicit bool) error {
 	if strings.TrimSpace(a.ID) == "" {
 		a.ID = fmt.Sprintf("acc_%d", time.Now().UnixNano())
 	}
 	if strings.TrimSpace(a.Name) == "" {
 		a.Name = a.ID
 	}
-	if strings.TrimSpace(a.Plan) == "" {
-		a.Plan = "pro"
-	}
 	if a.MaxConcurrency < 0 {
 		return fmt.Errorf("最大并发槽位不能为负数")
 	}
-
-	tagsJSON := "[]"
-	if len(a.Tags) > 0 {
-		if b, err := json.Marshal(a.Tags); err == nil {
-			tagsJSON = string(b)
+	if explicit {
+		if err := mergeSavedAccountCookies(tx, &a); err != nil {
+			return err
 		}
 	}
 
+	tagsJSON := accountTagsJSON(a.Tags)
+	cookieMapJSON, err := json.Marshal(a.CookieMap)
+	if err != nil {
+		return err
+	}
+	headersJSON, err := json.Marshal(a.Headers)
+	if err != nil {
+		return err
+	}
+	expiresAt := ""
+	if a.ExpiresAt != nil {
+		expiresAt = a.ExpiresAt.Format(time.RFC3339Nano)
+	}
+
 	query := `
-	INSERT INTO accounts (id, name, plan, email, cookies, access_token, refresh_token, max_concurrency, tags, enabled, updated_at)
-	SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP
+	INSERT INTO accounts (id, name, plan, email, cookies, access_token, refresh_token, max_concurrency, tags, enabled,
+		cookie_map, session_token, expires_at, account_id, proxy, rate_per_second, rate_burst, weight, headers, updated_at)
+	SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP
 	WHERE ? OR NOT EXISTS (SELECT 1 FROM deleted_accounts WHERE id = ?)
 	ON CONFLICT(id) DO UPDATE SET
 		name = excluded.name,
 		plan = excluded.plan,
 		email = excluded.email,
-		cookies = CASE WHEN excluded.cookies != '' THEN excluded.cookies ELSE accounts.cookies END,
+		cookies = CASE WHEN ? OR excluded.cookies != '' THEN excluded.cookies ELSE accounts.cookies END,
 		access_token = CASE WHEN excluded.access_token != '' THEN excluded.access_token ELSE accounts.access_token END,
 		refresh_token = CASE WHEN excluded.refresh_token != '' THEN excluded.refresh_token ELSE accounts.refresh_token END,
+		cookie_map = CASE WHEN ? OR excluded.cookie_map != 'null' THEN excluded.cookie_map ELSE accounts.cookie_map END,
+		session_token = CASE WHEN excluded.session_token != '' THEN excluded.session_token ELSE accounts.session_token END,
+		expires_at = CASE WHEN excluded.expires_at != '' THEN excluded.expires_at ELSE accounts.expires_at END,
+		account_id = CASE WHEN excluded.account_id != '' THEN excluded.account_id ELSE accounts.account_id END,
+		proxy = excluded.proxy,
+		rate_per_second = excluded.rate_per_second,
+		rate_burst = excluded.rate_burst,
+		weight = excluded.weight,
+		headers = CASE WHEN excluded.headers != 'null' THEN excluded.headers ELSE accounts.headers END,
 		max_concurrency = excluded.max_concurrency,
 		tags = excluded.tags,
 		enabled = CASE WHEN ? THEN excluded.enabled ELSE accounts.enabled END,
 		updated_at = CURRENT_TIMESTAMP;
 	`
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
 	_, err = tx.Exec(query,
 		a.ID,
 		a.Name,
@@ -385,8 +718,19 @@ func (s *SQLiteStore) saveAccount(a config.AccountConfig, explicit bool) error {
 		a.MaxConcurrency,
 		tagsJSON,
 		a.IsEnabled(),
+		string(cookieMapJSON),
+		a.SessionToken,
+		expiresAt,
+		a.AccountID,
+		a.Proxy,
+		a.RatePerSecond,
+		a.RateBurst,
+		a.Weight,
+		string(headersJSON),
 		explicit,
 		a.ID,
+		explicit,
+		explicit,
 		a.Enabled != nil,
 	)
 	if err != nil {
@@ -397,7 +741,82 @@ func (s *SQLiteStore) saveAccount(a config.AccountConfig, explicit bool) error {
 			return err
 		}
 	}
-	return tx.Commit()
+	return nil
+}
+
+// Deliberate replacements must agree with cookies, which Prism prioritizes on the wire.
+func mergeSavedAccountCookies(tx *sql.Tx, a *config.AccountConfig) error {
+	var current config.AccountConfig
+	var cookieMap string
+	err := tx.QueryRow(`SELECT cookies, cookie_map FROM accounts WHERE id = ?`, a.ID).
+		Scan(&current.Cookies, &cookieMap)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if cookieMap != "" {
+		if err := json.Unmarshal([]byte(cookieMap), &current.CookieMap); err != nil {
+			return fmt.Errorf("decode saved cookie map: %w", err)
+		}
+	}
+	replacingCookies := a.Cookies != "" || a.CookieMap != nil
+	if !replacingCookies {
+		a.Cookies, a.CookieMap = current.Cookies, current.CookieMap
+	}
+	cookies := creds.FromAccountConfig(config.AccountConfig{Cookies: a.Cookies, CookieMap: a.CookieMap})
+	if replacingCookies {
+		if a.AccessToken == "" {
+			a.AccessToken = cookies.AccessToken
+		}
+		if a.RefreshToken == "" {
+			a.RefreshToken = cookies.RefreshToken
+		}
+		if a.SessionToken == "" {
+			a.SessionToken = cookies.SessionToken
+		}
+	}
+	if cookies.CookieHeader == "" {
+		return nil
+	}
+	sessionNames := []string{creds.CookiePrismSessionToken, creds.CookieSessionToken, creds.CookieSessionTokenLoose, creds.CookieAuthSession}
+	for _, token := range []struct {
+		names []string
+		value string
+	}{
+		{[]string{creds.CookiePrismAccessToken}, a.AccessToken},
+		{[]string{creds.CookiePrismRefreshToken}, a.RefreshToken},
+		{sessionNames, a.SessionToken},
+	} {
+		if token.value == "" {
+			continue
+		}
+		names := make([]string, 0, len(token.names))
+		changed := false
+		for _, name := range token.names {
+			if value := creds.CookieValue(cookies.CookieHeader, name); value != "" {
+				names = append(names, name)
+				changed = changed || value != token.value
+			}
+		}
+		if !changed {
+			continue
+		}
+		for _, name := range names {
+			cookies.CookieHeader = creds.MergeCookie(cookies.CookieHeader, &http.Cookie{Name: name, Value: token.value})
+		}
+		a.Cookies, a.CookieMap = cookies.CookieHeader, nil
+	}
+	return nil
+}
+
+func accountTagsJSON(tags []string) string {
+	if len(tags) == 0 {
+		return "[]"
+	}
+	b, _ := json.Marshal(tags)
+	return string(b)
 }
 
 // DeleteAccount 从 SQLite 中物理删除账号 (Delete)。
@@ -584,6 +1003,20 @@ func (s *SQLiteStore) RecordRequestLog(item RequestLogItem) error {
 		item.ClientIP,
 		item.UserAgent,
 	)
+	return err
+}
+
+// PruneRequestLogs removes only logs older than an explicitly supplied cutoff.
+func (s *SQLiteStore) PruneRequestLogs(before time.Time) error {
+	if s == nil {
+		return errSQLiteUnavailable
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db == nil {
+		return errSQLiteUnavailable
+	}
+	_, err := s.db.Exec(`DELETE FROM request_logs WHERE timestamp < ?`, before.UTC().Format("2006-01-02 15:04:05"))
 	return err
 }
 

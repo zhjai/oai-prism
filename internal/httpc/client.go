@@ -50,8 +50,12 @@ type Options struct {
 // New 依据配置构造客户端。
 func New(cfg config.UpstreamConfig, opts Options) (*Client, error) {
 	base, err := url.Parse(cfg.BaseURL)
+	if err != nil || base.Host == "" || (base.Scheme != "http" && base.Scheme != "https") {
+		return nil, fmt.Errorf("上游 BaseURL 必须是有效的 HTTP(S) 地址")
+	}
+	proxy, err := proxyFunc(pick(cfg.HTTPProxy, opts.Proxy))
 	if err != nil {
-		return nil, fmt.Errorf("上游 BaseURL 非法: %w", err)
+		return nil, err
 	}
 
 	dialer := &net.Dialer{
@@ -85,7 +89,7 @@ func New(cfg config.UpstreamConfig, opts Options) (*Client, error) {
 		rt = bt
 	} else {
 		tr = &http.Transport{
-			Proxy:                 proxyFunc(pick(cfg.HTTPProxy, opts.Proxy)),
+			Proxy:                 proxy,
 			DialContext:           dialer.DialContext,
 			ForceAttemptHTTP2:     forceH2,
 			MaxIdleConns:          cfg.MaxIdleConns,
@@ -131,23 +135,19 @@ func pick(a, b string) string {
 	return a
 }
 
-func proxyFunc(raw string) func(*http.Request) (*url.URL, error) {
+func proxyFunc(raw string) (func(*http.Request) (*url.URL, error), error) {
 	if raw == "" {
-		return nil
+		return nil, nil
 	}
 	u, err := url.Parse(raw)
-	if err != nil {
-		return nil
+	if err != nil || u.Hostname() == "" {
+		return nil, fmt.Errorf("代理地址无效")
 	}
 	switch u.Scheme {
-	case "http", "https":
-		return http.ProxyURL(u)
-	case "socks5", "socks5h":
-		// 标准库不支持 socks5，需要额外依赖；这里明确报错而不是静默直连，
-		// 静默直连会让"以为走了代理"的部署直接暴露真实出口 IP。
-		panic(fmt.Sprintf("socks5 代理需要 x/net/proxy 支持，暂未内置: %s", raw))
+	case "http", "https", "socks5", "socks5h":
+		return http.ProxyURL(u), nil
 	default:
-		return http.ProxyURL(u)
+		return nil, fmt.Errorf("代理协议必须是 http、https、socks5 或 socks5h")
 	}
 }
 

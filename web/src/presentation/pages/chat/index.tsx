@@ -227,7 +227,7 @@ export const ChatPlaygroundPage: React.FC = () => {
                 items={[
                   {
                     title: '深度推理过程',
-                    status: m.status === 'loading' ? 'loading' : 'success',
+                    status: m.status === 'loading' ? 'loading' : m.status === 'error' ? 'error' : 'success',
                     description: <MarkdownView content={m.reasoning} streaming={streaming} className="md-reasoning" />,
                   },
                 ]}

@@ -921,16 +921,19 @@ func ExecToolName(raw map[string]json.RawMessage) string {
 //
 // 判定方式：在 tools 定义里看该工具的 type 字段。
 func ExecToolKind(raw map[string]json.RawMessage) string {
-	hay := string(raw["tools"])
-	if hay == "" || hay == "null" {
-		hay = string(raw["input"])
+	data := raw["tools"]
+	if len(data) == 0 || strings.TrimSpace(string(data)) == "null" {
+		data = raw["input"]
 	}
-	// function 类型：{"type":"function","name":"exec_command",...}
-	for _, sig := range []string{
-		`"type":"function","name":"exec_command"`, `"type": "function", "name": "exec_command"`,
-		`"type":"function","name":"exec"`, `"type": "function", "name": "exec"`,
-	} {
-		if strings.Contains(hay, sig) {
+	var tools []struct {
+		Type string `json:"type"`
+		Name string `json:"name"`
+	}
+	if json.Unmarshal(data, &tools) != nil {
+		return "custom"
+	}
+	for _, tool := range tools {
+		if tool.Type == "function" && (tool.Name == "exec_command" || tool.Name == "exec") {
 			return "function"
 		}
 	}

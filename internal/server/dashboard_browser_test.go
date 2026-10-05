@@ -28,3 +28,19 @@ func TestDashboardBrowser(t *testing.T) {
 	}
 	t.Log(string(output))
 }
+
+func TestDashboardBrowserBootstrap(t *testing.T) {
+	if os.Getenv("OAIPRISM_BROWSER_TEST") != "1" {
+		t.Skip("opt-in Playwright verification")
+	}
+	ts, _ := newTestServer(t, &fakeUpstream{t: t}, []config.AccountConfig{
+		{ID: "a", Name: "Account A", AccessToken: "test-token-a"},
+	}, nil)
+	cmd := exec.Command("node", filepath.Join("..", "..", "tools", "test_dashboard_bindings.mjs"))
+	cmd.Env = append(os.Environ(), "OAIPRISM_BROWSER_URL="+ts.URL, "OAIPRISM_BROWSER_BOOTSTRAP=1")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("browser bootstrap verification: %v\n%s", err, output)
+	}
+	t.Log(string(output))
+}

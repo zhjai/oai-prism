@@ -19,25 +19,31 @@ import (
 // 因此这些字段全部用 atomic；只有限流桶用了 mutex（临界区仅几纳秒，
 // 且只在账号显式配置了速率限制时才存在）。
 type Account struct {
-	ID      string
-	Name    string
-	Tags    []string
-	Weight  int
-	plan    string // Local plan label; refreshed upstream claims remain in the credential.
-	enabled atomic.Bool
+	ID     string
+	Name   string
+	Tags   []string
+	Weight int
+	plan   string // Local plan label; refreshed upstream claims remain in the credential.
 
 	// Client 是该账号专属的上游客户端（可能走独立出口代理）。
 	Client *httpc.Client
+	*accountRuntime
+}
+
+// Leases and refreshes keep sharing state when configuration snapshots change.
+type accountRuntime struct {
+	enabled atomic.Bool
+	maxConc atomic.Int64
 
 	// cred 是不可变快照，刷新时整体替换。用 atomic.Pointer 实现无锁读。
 	cred atomic.Pointer[creds.Credential]
 
 	// 并发闸门。
-	maxConc  int64
 	inflight atomic.Int64
 
 	// 限流器，nil 表示不限流。使用官方标准库 rate.Limiter。
-	limiter *rate.Limiter
+	limiterMu sync.Mutex
+	limiter   *rate.Limiter
 
 	// 冷却：命中 401/429 后进入冷却，调度器跳过。
 	cooldownUntil atomic.Int64 // unix nano
@@ -56,11 +62,14 @@ type Account struct {
 	lastUsedUnix atomic.Int64
 
 	// refreshing 保证同一账号同一时刻只有一次刷新在飞。
-	refreshing atomic.Bool
-
-	// refreshingMu 让并发请求可以"等待"正在进行的刷新，而不是各自触发一次。
 	refreshMu   sync.Mutex
-	refreshCond *sync.Cond
+	refreshCall *refreshCall
+}
+
+type refreshCall struct {
+	done       chan struct{}
+	credential *creds.Credential
+	err        error
 }
 
 // Credential 返回当前凭据快照（无锁）。
@@ -73,7 +82,7 @@ func (a *Account) StoreCredential(c *creds.Credential) { a.cred.Store(c) }
 func (a *Account) Inflight() int64 { return a.inflight.Load() }
 
 // MaxConcurrency 并发上限，0 表示不限。
-func (a *Account) MaxConcurrency() int64 { return a.maxConc }
+func (a *Account) MaxConcurrency() int64 { return a.maxConc.Load() }
 
 // Available 判断账号当前是否可被调度。
 // Busy 报告账号是否"仅因并发已满而暂不可用"（未冷却且凭据可用）。
@@ -81,7 +90,8 @@ func (a *Account) Busy(now time.Time) bool {
 	if !a.enabled.Load() {
 		return false
 	}
-	if a.maxConc <= 0 || a.inflight.Load() < a.maxConc {
+	limit := a.maxConc.Load()
+	if limit <= 0 || a.inflight.Load() < limit {
 		return false
 	}
 	if until := a.cooldownUntil.Load(); until > 0 && now.UnixNano() < until {
@@ -94,7 +104,8 @@ func (a *Account) Available(now time.Time) bool {
 	if !a.enabled.Load() {
 		return false
 	}
-	if a.maxConc > 0 && a.inflight.Load() >= a.maxConc {
+	limit := a.maxConc.Load()
+	if limit > 0 && a.inflight.Load() >= limit {
 		return false
 	}
 	if until := a.cooldownUntil.Load(); until > 0 && now.UnixNano() < until {
@@ -122,10 +133,11 @@ func (a *Account) Acquire(now time.Time) bool {
 	if !a.Available(now) {
 		return false
 	}
-	if a.maxConc > 0 {
+	if a.maxConc.Load() > 0 {
 		for {
 			cur := a.inflight.Load()
-			if cur >= a.maxConc {
+			limit := a.maxConc.Load()
+			if limit > 0 && cur >= limit {
 				return false
 			}
 			if a.inflight.CompareAndSwap(cur, cur+1) {
@@ -135,7 +147,10 @@ func (a *Account) Acquire(now time.Time) bool {
 	} else {
 		a.inflight.Add(1)
 	}
-	if a.limiter != nil && !a.limiter.AllowN(now, 1) {
+	a.limiterMu.Lock()
+	allowed := a.limiter == nil || a.limiter.AllowN(now, 1)
+	a.limiterMu.Unlock()
+	if !allowed {
 		a.inflight.Add(-1)
 		return false
 	}
@@ -228,7 +243,7 @@ func (a *Account) Stats(now time.Time) Stats {
 		Enabled:    a.enabled.Load(),
 		Available:  a.Available(now),
 		Inflight:   a.inflight.Load(),
-		MaxConcur:  a.maxConc,
+		MaxConcur:  a.maxConc.Load(),
 		FailStreak: a.failStreak.Load(),
 		Total:      a.total.Load(),
 		Failures:   a.failures.Load(),
@@ -248,7 +263,7 @@ func (a *Account) Stats(now time.Time) Stats {
 		s.HasSession = c.SessionToken != "" || creds.HasSessionCookie(c.CookieHeader)
 		if !c.ExpiresAt.IsZero() {
 			s.TokenExpires = c.ExpiresAt.UTC().Format(time.RFC3339)
-			s.ExpiresInSec = int64(time.Until(c.ExpiresAt).Seconds())
+			s.ExpiresInSec = int64(c.ExpiresAt.Sub(now).Seconds())
 		}
 	}
 	if u := a.lastUsedUnix.Load(); u > 0 {
@@ -260,13 +275,13 @@ func (a *Account) Stats(now time.Time) Stats {
 // newAccount 从配置构造账号。client 由调用方注入（可能带独立代理）。
 func newAccount(cfg config.AccountConfig, client *httpc.Client, c *creds.Credential) *Account {
 	a := &Account{
-		ID:      cfg.ID,
-		Name:    cfg.Name,
-		Tags:    cfg.Tags,
-		Weight:  cfg.Weight,
-		plan:    cfg.Plan,
-		Client:  client,
-		maxConc: int64(cfg.MaxConcurrency),
+		ID:             cfg.ID,
+		Name:           cfg.Name,
+		Tags:           cfg.Tags,
+		Weight:         cfg.Weight,
+		plan:           cfg.Plan,
+		Client:         client,
+		accountRuntime: &accountRuntime{},
 	}
 	if a.Name == "" {
 		a.Name = a.ID
@@ -285,9 +300,28 @@ func newAccount(cfg config.AccountConfig, client *httpc.Client, c *creds.Credent
 		a.limiter = rate.NewLimiter(rate.Limit(cfg.RatePerSecond), burst)
 	}
 	a.cred.Store(c)
+	a.maxConc.Store(int64(cfg.MaxConcurrency))
 	a.enabled.Store(cfg.IsEnabled())
-	a.refreshCond = sync.NewCond(&a.refreshMu)
 	return a
+}
+
+func (a *Account) configureLimiter(cfg config.AccountConfig) {
+	a.limiterMu.Lock()
+	defer a.limiterMu.Unlock()
+	if cfg.RatePerSecond <= 0 {
+		a.limiter = nil
+		return
+	}
+	burst := cfg.RateBurst
+	if burst <= 0 {
+		burst = max(1, int(cfg.RatePerSecond))
+	}
+	if a.limiter == nil {
+		a.limiter = rate.NewLimiter(rate.Limit(cfg.RatePerSecond), burst)
+	} else {
+		a.limiter.SetLimit(rate.Limit(cfg.RatePerSecond))
+		a.limiter.SetBurst(burst)
+	}
 }
 
 // Fingerprint 是用于负载均衡的稳定键。

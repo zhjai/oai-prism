@@ -1,5 +1,7 @@
 import type {
+  AccountConfig,
   AccountStats,
+  AdminAccountImportResponse,
   AdminAccountsResponse,
   AdminRefreshResponse,
 } from '../../domain/account/entity';
@@ -11,21 +13,11 @@ export class LocalAccountRepositoryImpl implements IAccountRepository {
    * 直连后端真实 GET /admin/accounts 接口
    */
   async fetchAccounts(): Promise<AdminAccountsResponse> {
-    try {
-      const res = await httpClient.get<AdminAccountsResponse>('/admin/accounts');
-      if (res.data && Array.isArray(res.data.accounts)) {
-        return res.data;
-      }
-    } catch {
-      // 忽略网络异常
+    const res = await httpClient.get<AdminAccountsResponse>('/admin/accounts');
+    if (!res.data || !Array.isArray(res.data.accounts)) {
+      throw new Error('账号列表响应格式无效');
     }
-
-    return {
-      count: 0,
-      ready: 0,
-      creds_file: 'sqlite:secrets/accounts.db',
-      accounts: [],
-    };
+    return res.data;
   }
 
   /**
@@ -33,6 +25,14 @@ export class LocalAccountRepositoryImpl implements IAccountRepository {
    */
   async createAccount(account: Partial<AccountStats> | Partial<AccountStats>[]): Promise<void> {
     await httpClient.post('/admin/accounts', account);
+  }
+
+  async importAccounts(accounts: AccountConfig[], verify: boolean): Promise<AdminAccountImportResponse> {
+    const res = await httpClient.post<AdminAccountImportResponse>('/admin/accounts/import', {
+      accounts,
+      verify,
+    }, { timeout: 180000 });
+    return res.data;
   }
 
   /**

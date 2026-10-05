@@ -18,11 +18,83 @@ interface StatCardProps {
   color: string;
   footer?: React.ReactNode;
   loading?: boolean;
+  /**
+   * 紧凑单行版：窄屏下四张指标卡纵排会吃光视口高度，
+   * 把标题压成一行、数值与图标并排，整卡高度降到约 56px。
+   */
+  compact?: boolean;
 }
 
 /** 指标卡：标题 + 图标徽记 + 大号数值 + 附注，统计页与账号页共用 */
-export const StatCard: React.FC<StatCardProps> = ({ title, value, suffix, icon, color, footer, loading }) => {
+export const StatCard: React.FC<StatCardProps> = ({ title, value, suffix, icon, color, footer, loading, compact }) => {
   const { token } = theme.useToken();
+
+  const badge = (size: number, fontSize: number) => (
+    <div
+      style={{
+        width: size,
+        height: size,
+        borderRadius: size <= 30 ? 8 : 10,
+        display: 'grid',
+        placeItems: 'center',
+        fontSize,
+        color,
+        background: withAlpha(color, 0.12),
+        flexShrink: 0,
+      }}
+    >
+      {icon}
+    </div>
+  );
+
+  if (compact) {
+    return (
+      <Card
+        variant="outlined"
+        style={{ height: '100%', boxShadow: token.boxShadowTertiary }}
+        styles={{ body: { padding: '10px 12px' } }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+          {badge(30, 15)}
+          <div style={{ minWidth: 0, flex: 1 }}>
+            <div
+              style={{
+                color: token.colorTextSecondary,
+                fontSize: 12,
+                lineHeight: 1.3,
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+              }}
+            >
+              {title}
+            </div>
+            {loading ? (
+              <Skeleton.Input active size="small" style={{ width: 56, height: 20, minWidth: 56 }} />
+            ) : (
+              <div
+                style={{
+                  fontSize: 19,
+                  fontWeight: 600,
+                  lineHeight: 1.25,
+                  color: token.colorTextHeading,
+                  fontVariantNumeric: 'tabular-nums',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {value}
+                {suffix != null && (
+                  <span style={{ fontSize: 12, fontWeight: 500, color: token.colorTextTertiary, marginLeft: 3 }}>
+                    {suffix}
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      </Card>
+    );
+  }
 
   return (
     <Card
@@ -55,21 +127,7 @@ export const StatCard: React.FC<StatCardProps> = ({ title, value, suffix, icon, 
             </div>
           )}
         </div>
-        <div
-          style={{
-            width: 40,
-            height: 40,
-            borderRadius: 10,
-            display: 'grid',
-            placeItems: 'center',
-            fontSize: 18,
-            color,
-            background: withAlpha(color, 0.12),
-            flexShrink: 0,
-          }}
-        >
-          {icon}
-        </div>
+        {badge(40, 18)}
       </div>
       {footer && (
         <div

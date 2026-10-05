@@ -60,7 +60,7 @@ OAIprism 把这些全部收进网关，对外只暴露你已经在用的标准�
   <tr>
     <td width="33%" valign="top">
       <b>🔌 标准协议，零改造接入</b><br><br>
-      OpenAI Chat Completions / Responses、Anthropic Messages 全兼容，含完整的流式事件序列。
+      提供 OpenAI Chat Completions / Responses、Anthropic Messages 接口，支持流式输出；可用模型和参数受 Prism 上游能力限制。
     </td>
     <td width="33%" valign="top">
       <b>🛠️ Codex 工具桥</b><br><br>
@@ -106,7 +106,7 @@ case "$(uname -m)" in
   aarch64|arm64) arch=arm64 ;;
   *) echo "不支持的架构：$(uname -m)"; exit 1 ;;
 esac
-version=v0.1.0-zhjai.2
+version=v0.1.0-zhjai.5
 asset="oaiprism-${version}-linux-${arch}.tar.gz"
 url="https://github.com/zhjai/oai-prism/releases/download/${version}"
 curl -fLO "${url}/${asset}"
@@ -120,13 +120,15 @@ cd "$HOME/.local/share/oaiprism"
 ./oaiprism version
 
 # 从标准输入粘贴 prism.openai.com 的整串 Cookie，按 Ctrl+D 结束
-./oaiprism import -stdin -id main
+./oaiprism import -stdin
 
 # 前台启动；首次自动创建 configs/config.yaml，Ctrl+C 停止
 ./tools/start.sh
 ```
 
-也可以不预先导入账号，直接启动后在 Dashboard 的「账号与计划池」中通过 OAuth 导入。
+也可以不预先导入账号，直接启动后在 Dashboard 的「账号与计划池」点击「导入新账号」，
+填写名称、完整 Cookie、最大并发数和计划标签。默认在线验证后保存，也支持 JSON 批量导入和 OAuth。
+终端导入默认按登录身份生成 ID，不同账号不会覆盖；同一身份会更新。手动指定 `-id` 时请为不同账号使用不同 ID。
 服务器上运行时，在自己的电脑建立 SSH 隧道，再访问本机 Dashboard：
 
 ```bash
@@ -143,7 +145,7 @@ ssh -N -L 8787:127.0.0.1:8787 user@your-server
 git clone https://github.com/zhjai/oai-prism.git
 cd oai-prism
 go build -trimpath -o oaiprism ./cmd/oaiprism
-./oaiprism import -stdin -id main
+./oaiprism import -stdin
 ./tools/start.sh
 ```
 
@@ -159,7 +161,7 @@ cd oai-prism
 go build -o oaiprism.exe ./cmd/oaiprism
 
 # 2. 导入账号：粘贴 prism.openai.com 的 Cookie、access token 或 refresh token
-.\oaiprism.exe import -stdin -id main
+.\oaiprism.exe import -stdin
 
 # 3. 启动（只有网关一个进程，监听 8787）
 .\tools\start.ps1
@@ -243,7 +245,7 @@ print(msg.content[0].text)
 内置于网关的 `/dashboard/`，无需额外部署。浅色、深色、跟随系统三种外观。
 
 - **账号启停**：在「账号与计划池」的启用开关中操作，保存后立即生效。停用账号保留在列表中，不接收新请求；刷新、重载和重启后仍保留设置。
-- **账号删除**：删除会同时移除凭据文件中的对应账号并记录删除状态，自动重载、手动重载和重启后不会重新出现。需要恢复时，在网页中重新添加或导入该账号；只停用请使用启用开关。
+- **账号删除**：在网页删除会同时移除凭据文件中的对应账号并记录删除状态，自动重载、手动重载和重启后不会重新出现。`accounts.json` 是凭据导入源，手动从文件移除一项不会删除 SQLite 中的账号；请通过网页删除或停用。需要恢复时，在网页中重新添加或导入该账号。
 - **API Key 多账号绑定**：在「对外 API 密钥」生成 Key 时多选账号，或点击已有 Key 的「绑定账号」修改。未绑定时使用全部启用账号，绑定后只在选定账号中调度。删除最后一个绑定账号后 Key 保持无可用绑定账号，需重新绑定或明确清空绑定。
 - **网页版 Chat 调试台选账号**：在输入框旁的「调试账号」下拉框选择自动调度或指定账号，选择按会话保存。列表遵循当前 Key 的绑定范围；指定账号停用或暂不可用时会报错，不会自动换号。
 
@@ -325,7 +327,7 @@ cd web && pnpm install && npx tsc --noEmit && pnpm build
 - CI 在任意分支 push / PR 时运行 Go 门禁（vet → test → race → 构建 → 交叉编译 linux/amd64、arm64）
   与 Dashboard 门禁（tsc → vite build）。
 - 推送 `v*` 标签触发 Release 工作流：完成 Go 与 Dashboard 门禁后，为 Linux amd64/arm64 打包并生成 `SHA256SUMS`。
-  本地等价打包命令：`./tools/package_linux.sh v0.1.0-zhjai.2`，产物位于 `dist/`。
+  本地等价打包命令：`./tools/package_linux.sh v0.1.0-zhjai.5`，产物位于 `dist/`。
 
 欢迎提交 Issue 与 Pull Request。较大的改动请先开 Issue 讨论方向。
 

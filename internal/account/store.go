@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -189,6 +190,14 @@ func (s *Store) Persist(list []config.AccountConfig) error {
 	if err != nil {
 		return err
 	}
+	if raw, readErr := os.ReadFile(s.path); readErr == nil {
+		buf, err = preserveAccountDocument(raw, buf, list)
+		if err != nil {
+			return fmt.Errorf("保留现有账号文档: %w", err)
+		}
+	} else if !os.IsNotExist(readErr) {
+		return readErr
+	}
 
 	if err := s.writeLocked(buf); err != nil {
 		return err
@@ -202,6 +211,90 @@ func (s *Store) Persist(list []config.AccountConfig) error {
 		s.loaded = true
 	}
 	return nil
+}
+
+// Preserve operator metadata and untouched entries when deliberately upserting.
+func preserveAccountDocument(raw, canonical []byte, next []config.AccountConfig) ([]byte, error) {
+	previous, err := ParseAccounts(raw)
+	if err != nil {
+		return nil, err
+	}
+	var wrapper map[string]json.RawMessage
+	var entries []json.RawMessage
+	key := ""
+	trimmed := strings.TrimSpace(string(raw))
+	if strings.HasPrefix(trimmed, "{") {
+		if err := json.Unmarshal(raw, &wrapper); err != nil {
+			return nil, err
+		}
+		for k := range wrapper {
+			if strings.EqualFold(k, "accounts") {
+				key = k
+				break
+			}
+		}
+		if key == "" {
+			return nil, fmt.Errorf("账号文档缺少 accounts 数组")
+		}
+		raw = wrapper[key]
+	}
+	if trimmed != "" && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &entries); err != nil {
+			return nil, err
+		}
+	}
+	var fresh struct {
+		Accounts []json.RawMessage `json:"accounts"`
+	}
+	if err := json.Unmarshal(canonical, &fresh); err != nil {
+		return nil, err
+	}
+	byID := make(map[string]int, len(previous))
+	for i, a := range previous {
+		byID[a.ID] = i
+	}
+	for i, a := range next {
+		oldIndex, found := byID[a.ID]
+		if !found || oldIndex >= len(entries) {
+			continue
+		}
+		if reflect.DeepEqual(a, previous[oldIndex]) {
+			fresh.Accounts[i] = entries[oldIndex]
+			continue
+		}
+		var oldFields, newFields map[string]json.RawMessage
+		if err := json.Unmarshal(entries[oldIndex], &oldFields); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(fresh.Accounts[i], &newFields); err != nil {
+			return nil, err
+		}
+		for k := range oldFields {
+			switch normKey(k) {
+			case "id", "name", "enabled", "cookies", "cookie", "cookiemap", "sessiontoken", "session", "accesstoken", "token", "jwt", "bearertoken", "refreshtoken", "expiresat", "accountid", "chatgptaccountid", "deviceid", "email", "plan", "plantype", "proxy", "maxconcurrency", "concurrency", "ratepersecond", "rate", "rateburst", "burst", "weight", "headers", "tags", "updatedat":
+				delete(oldFields, k)
+			}
+		}
+		for k, v := range newFields {
+			oldFields[k] = v
+		}
+		fresh.Accounts[i], err = json.Marshal(oldFields)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if wrapper == nil && strings.HasPrefix(trimmed, "[") {
+		return json.MarshalIndent(fresh.Accounts, "", "  ")
+	}
+	if wrapper == nil {
+		wrapper = make(map[string]json.RawMessage)
+		key = "accounts"
+	}
+	wrapper[key], err = json.Marshal(fresh.Accounts)
+	if err != nil {
+		return nil, err
+	}
+	return json.MarshalIndent(wrapper, "", "  ")
 }
 
 // DeleteAccount edits the source document, preserving other credentials and metadata.

@@ -152,7 +152,14 @@ func (r *Refresher) FetchSession(ctx context.Context, cur *Credential) (*Credent
 	// 把响应里刷新的 Cookie 回写，保持会话延续。
 	for _, c := range resp.Cookies() {
 		next.CookieHeader = MergeCookie(next.CookieHeader, c)
+		switch c.Name {
+		case CookiePrismSessionToken, CookieSessionToken, CookieSessionTokenLoose, CookieAuthSession:
+			next.SessionToken, next.SessionCookieName = c.Value, c.Name
+		case CookiePrismRefreshToken:
+			next.RefreshToken = c.Value
+		}
 	}
+	synchronizeTokenCookies(next)
 
 	if !next.Usable() {
 		return nil, fmt.Errorf("会话接口未返回可用的 accessToken（可能登录态已失效）")
@@ -263,7 +270,30 @@ func (r *Refresher) RefreshOAuth(ctx context.Context, cur *Credential) (*Credent
 		next.applyJWT(or.IDToken)
 		next.ExpiresAt = saved
 	}
+	synchronizeTokenCookies(next)
 	return next, nil
+}
+
+func synchronizeTokenCookies(credential *Credential) {
+	if credential.CookieHeader == "" {
+		return
+	}
+	sessionName := credential.SessionCookieName
+	if sessionName == "" {
+		sessionName, _ = CookieValueWithName(credential.CookieHeader, allSessionCookieNames...)
+	}
+	if sessionName == "" {
+		sessionName = CookiePrismSessionToken
+	}
+	for _, token := range []struct{ name, value string }{
+		{CookiePrismAccessToken, credential.AccessToken},
+		{CookiePrismRefreshToken, credential.RefreshToken},
+		{sessionName, credential.SessionToken},
+	} {
+		if token.value != "" {
+			credential.CookieHeader = MergeCookie(credential.CookieHeader, &http.Cookie{Name: token.name, Value: token.value})
+		}
+	}
 }
 
 // Refresh 按优先级自动选择刷新路径。

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
+	"reflect"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -32,8 +33,11 @@ type Pool struct {
 	log    *slog.Logger
 	client *httpc.Client
 
-	accounts atomic.Pointer[[]*Account]
-	sticky   *stickyMap
+	accounts          atomic.Pointer[[]*Account]
+	sticky            *stickyMap
+	buildMu           sync.Mutex
+	persistCredential func(string, *creds.Credential, *creds.Credential) (bool, error)
+	proxyClients      map[string]*httpc.Client
 
 	rr atomic.Uint64
 }
@@ -54,6 +58,7 @@ func NewPool(cfg *config.Config, log *slog.Logger) (*Pool, error) {
 		sticky: newStickyMap(64, cfg.Pool.StickyTTL),
 	}
 	if err := p.Build(cfg.Creds.Accounts); err != nil {
+		baseClient.CloseIdle()
 		return nil, err
 	}
 	return p, nil
@@ -62,9 +67,47 @@ func NewPool(cfg *config.Config, log *slog.Logger) (*Pool, error) {
 // Client 返回共享的上游客户端（无账号专属代理时使用）。
 func (p *Pool) Client() *httpc.Client { return p.client }
 
+// Close releases idle connections, including retired configuration clients.
+func (p *Pool) Close() {
+	p.buildMu.Lock()
+	defer p.buildMu.Unlock()
+	p.client.CloseIdle()
+	for _, client := range p.proxyClients {
+		client.CloseIdle()
+	}
+}
+
 // Build 用给定的账号配置重建池。
 func (p *Pool) Build(cfgs []config.AccountConfig) error {
+	p.buildMu.Lock()
+	defer p.buildMu.Unlock()
+	return p.buildLocked(cfgs)
+}
+
+// Reload reads the persisted snapshot under the same lock as refresh commits.
+func (p *Pool) Reload(load func() ([]config.AccountConfig, error)) error {
+	p.buildMu.Lock()
+	defer p.buildMu.Unlock()
+	cfgs, err := load()
+	if err != nil {
+		return err
+	}
+	return p.buildLocked(cfgs)
+}
+
+func (p *Pool) buildLocked(cfgs []config.AccountConfig) (err error) {
 	built := make([]*Account, 0, len(cfgs))
+	clients := make(map[string]*httpc.Client)
+	created := make([]*httpc.Client, 0)
+	defer func() {
+		if err != nil {
+			for _, client := range created {
+				client.CloseIdle()
+			}
+		}
+	}()
+	credentials := make(map[string]*creds.Credential, len(cfgs))
+	configs := make(map[string]config.AccountConfig, len(cfgs))
 	seen := make(map[string]struct{}, len(cfgs))
 
 	for i, ac := range cfgs {
@@ -85,11 +128,19 @@ func (p *Pool) Build(cfgs []config.AccountConfig) error {
 		client := p.client
 		// 账号级出口代理：为每个不同代理建一个客户端（连接池也随之独立）。
 		if ac.Proxy != "" && ac.Proxy != p.up.HTTPProxy {
-			oc, err := httpc.New(p.up, httpc.Options{Proxy: ac.Proxy})
-			if err != nil {
-				return fmt.Errorf("账号 %s 构造代理客户端失败: %w", id, err)
+			client = clients[ac.Proxy]
+			if client == nil {
+				client = p.proxyClients[ac.Proxy]
 			}
-			client = oc
+			if client == nil {
+				var clientErr error
+				client, clientErr = httpc.New(p.up, httpc.Options{Proxy: ac.Proxy})
+				if clientErr != nil {
+					return fmt.Errorf("账号 %s 构造代理客户端失败: %w", id, clientErr)
+				}
+				created = append(created, client)
+			}
+			clients[ac.Proxy] = client
 		}
 
 		if ac.Name == "" {
@@ -98,10 +149,10 @@ func (p *Pool) Build(cfgs []config.AccountConfig) error {
 		ac.ID = id
 		a := newAccount(ac, client, c)
 		if old := p.Get(id); old != nil {
-			a.total.Store(old.total.Load())
-			a.failures.Store(old.failures.Load())
-			a.lastUsedUnix.Store(old.lastUsedUnix.Load())
+			a.accountRuntime = old.accountRuntime
 		}
+		credentials[id] = c
+		configs[id] = ac
 		built = append(built, a)
 	}
 
@@ -109,6 +160,19 @@ func (p *Pool) Build(cfgs []config.AccountConfig) error {
 		// 高权重优先，让 least_inflight 在平票时也倾向优质账号。
 		return built[i].Weight > built[j].Weight
 	})
+	for _, a := range built {
+		old := a.Credential()
+		next := credentials[a.ID]
+		if old == nil || old.AccessToken != next.AccessToken || old.RefreshToken != next.RefreshToken || old.SessionToken != next.SessionToken || old.CookieHeader != next.CookieHeader || !old.ExpiresAt.Equal(next.ExpiresAt) || !reflect.DeepEqual(old.Headers, next.Headers) || old.Email != next.Email || old.AccountID != next.AccountID {
+			a.StoreCredential(next)
+			if old == nil || old.AccessToken != next.AccessToken || old.RefreshToken != next.RefreshToken || old.SessionToken != next.SessionToken {
+				a.MarkSuccess()
+			}
+		}
+		a.enabled.Store(configs[a.ID].IsEnabled())
+		a.maxConc.Store(int64(configs[a.ID].MaxConcurrency))
+		a.configureLimiter(configs[a.ID])
+	}
 	// Apply changes to waiting requests only after validating the whole build.
 	for _, old := range p.Accounts() {
 		enabled := false
@@ -122,6 +186,12 @@ func (p *Pool) Build(cfgs []config.AccountConfig) error {
 	}
 
 	p.accounts.Store(&built)
+	for proxy, client := range p.proxyClients {
+		if clients[proxy] != client {
+			client.CloseIdle()
+		}
+	}
+	p.proxyClients = clients
 	if len(built) == 0 {
 		// 空池是启动初期的正常状态（凭据还没放进来），降级为 Debug，
 		// 免得让人误以为配置出了问题——真正的提示在 server 层给。
@@ -279,7 +349,7 @@ func (p *Pool) Acquire(ctx context.Context, stickyKey string) (*Lease, error) {
 	// 冷却是时间问题，并发上限则可能是容量不足——后者值得明确报出来。
 	busy := 0
 	for _, a := range all {
-		if a.maxConc > 0 && a.inflight.Load() >= a.maxConc {
+		if limit := a.maxConc.Load(); limit > 0 && a.inflight.Load() >= limit {
 			busy++
 		}
 	}
@@ -367,47 +437,50 @@ func (p *Pool) pick(all []*Account, now time.Time) *Account {
 			}
 		}
 	case "weighted":
-		totalW := 0
+		candidates := make([]*Account, 0, len(all))
 		for _, a := range all {
 			if a.Available(now) {
-				totalW += a.Weight
+				candidates = append(candidates, a)
 			}
 		}
-		if totalW > 0 {
-			target := rand.IntN(totalW)
-			acc := 0
-			for _, a := range all {
-				if !a.Available(now) {
-					continue
-				}
-				acc += a.Weight
-				if acc > target && a.Acquire(now) {
-					return a
+		for len(candidates) > 0 {
+			var totalW float64
+			for _, a := range candidates {
+				totalW += float64(a.Weight)
+			}
+			target := rand.Float64() * totalW
+			selected := len(candidates) - 1
+			for i, a := range candidates {
+				target -= float64(a.Weight)
+				if target < 0 {
+					selected = i
+					break
 				}
 			}
+			a := candidates[selected]
+			if a.Acquire(now) {
+				return a
+			}
+			candidates = append(candidates[:selected], candidates[selected+1:]...)
 		}
 	case "sticky_hash", "least_inflight":
 		fallthrough
 	default:
-		// least_inflight：在途数最少者优先，平票取权重高者。
-		// 这是代理场景的默认最优解——它天然把慢请求摊开，
-		// 避免 round_robin 把新请求继续压在已经拥堵的账号上。
-		var best *Account
-		var bestScore float64
+		// 尝试所有候选，避免限流或并发抢占使其他空闲账号无法接单。
+		candidates := make([]*Account, 0, len(all))
 		for _, a := range all {
-			if !a.Available(now) {
-				continue
-			}
-			score := float64(a.inflight.Load())
-			if a.Weight > 0 {
-				score /= float64(a.Weight)
-			}
-			if best == nil || score < bestScore {
-				best, bestScore = a, score
+			if a.Available(now) {
+				candidates = append(candidates, a)
 			}
 		}
-		if best != nil && best.Acquire(now) {
-			return best
+		sort.SliceStable(candidates, func(i, j int) bool {
+			a, b := candidates[i], candidates[j]
+			return float64(a.inflight.Load())/float64(a.Weight) < float64(b.inflight.Load())/float64(b.Weight)
+		})
+		for _, a := range candidates {
+			if a.Acquire(now) {
+				return a
+			}
 		}
 	}
 	return nil
@@ -552,7 +625,7 @@ func (p *Pool) refreshAll(ctx context.Context, r *creds.Refresher) {
 			continue
 		}
 		// 只刷新"快过期"或"已经挂了"的账号，避免无谓的刷新风暴。
-		need := c.NeedsRefresh(now, skew) || c.Expired(now)
+		need := !c.Usable() || a.AuthFailed() || c.NeedsRefresh(now, skew) || c.Expired(now)
 		if !need {
 			continue
 		}
@@ -568,47 +641,78 @@ func (p *Pool) refreshAll(ctx context.Context, r *creds.Refresher) {
 
 // RefreshAccount 刷新单个账号，并保证同一账号同一时刻只有一次刷新在飞。
 //
-// 这里用 Mutex + 条件变量而不是 x/sync/singleflight：
-// 我们需要"等待者拿到刷新后的新凭据"这一语义，singleflight 只能共享结果，
-// 且会引入一个额外依赖。
+// Waiters share the exact result and may cancel independently.
 func (p *Pool) RefreshAccount(ctx context.Context, r *creds.Refresher, a *Account) (*creds.Credential, error) {
-	if !a.refreshing.CompareAndSwap(false, true) {
-		// 已有刷新在飞，等它结束然后直接读结果。
-		a.refreshMu.Lock()
-		for a.refreshing.Load() {
-			a.refreshCond.Wait()
-		}
+	a.refreshMu.Lock()
+	if call := a.refreshCall; call != nil {
 		a.refreshMu.Unlock()
-		if c := a.Credential(); c != nil && c.Usable() {
-			return c, nil
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-call.done:
+			return call.credential, call.err
 		}
-		return nil, fmt.Errorf("账号 %s 刷新失败", a.ID)
 	}
-
-	var (
-		next *creds.Credential
-		err  error
-	)
+	call := &refreshCall{done: make(chan struct{})}
+	a.refreshCall = call
+	a.refreshMu.Unlock()
 	defer func() {
 		a.refreshMu.Lock()
-		a.refreshing.Store(false)
-		a.refreshCond.Broadcast()
+		a.refreshCall = nil
+		close(call.done)
 		a.refreshMu.Unlock()
 	}()
 
 	cur := a.Credential()
-	next, err = r.Refresh(ctx, cur)
+	if a.Client != nil {
+		var err error
+		r, err = creds.NewRefresher(p.creds, p.up, a.Client)
+		if err != nil {
+			call.err = err
+			return nil, err
+		}
+	}
+	next, err := r.Refresh(ctx, cur)
 	if err != nil {
+		call.err = err
 		return nil, err
 	}
-	a.StoreCredential(next)
+	p.buildMu.Lock()
+	defer p.buildMu.Unlock()
+	current := p.Get(a.ID)
+	if current == nil || current.accountRuntime != a.accountRuntime || a.Credential() != cur {
+		call.err = fmt.Errorf("账号已删除或凭据已更新，请重试")
+		return nil, call.err
+	}
+	if p.persistCredential != nil {
+		updated, err := p.persistCredential(a.ID, cur, next)
+		if err != nil {
+			call.err = fmt.Errorf("保存刷新凭据失败: %w", err)
+			return nil, call.err
+		}
+		if !updated {
+			call.err = fmt.Errorf("账号已删除或凭据已更新，请重试")
+			return nil, call.err
+		}
+	}
+	if !a.cred.CompareAndSwap(cur, next) {
+		call.err = fmt.Errorf("账号凭据已更新，请重试")
+		return nil, call.err
+	}
 	a.MarkSuccess()
+	call.credential = next
 	p.log.Info("账号凭据已刷新",
 		"account", a.ID,
 		"source", next.Source,
 		"expires_at", next.ExpiresAt.UTC().Format(time.RFC3339),
 		"plan", next.Plan)
 	return next, nil
+}
+
+func (p *Pool) SetCredentialPersister(fn func(string, *creds.Credential, *creds.Credential) (bool, error)) {
+	p.buildMu.Lock()
+	defer p.buildMu.Unlock()
+	p.persistCredential = fn
 }
 
 func (p *Pool) healthLoop(ctx context.Context, interval time.Duration) {

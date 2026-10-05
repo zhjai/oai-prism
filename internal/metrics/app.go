@@ -51,7 +51,7 @@ func NewApp() *App {
 		Reg: r,
 
 		HTTPRequests: r.Counter("oaiprism_http_requests_total", "入站 HTTP 请求数", "path", "method", "code"),
-		HTTPInflight: r.Counter("oaiprism_http_inflight_total", "入站请求并发累计（用于派生在途数）", "path"),
+		HTTPInflight: r.GaugeVec("oaiprism_http_inflight_total", "当前入站请求并发数", "path"),
 		HTTPDuration: r.Histogram("oaiprism_http_request_duration_seconds", "入站请求耗时", DefaultBuckets, "path", "method"),
 
 		UpstreamRequests: r.Counter("oaiprism_upstream_requests_total", "上游请求数", "path", "code"),

@@ -85,5 +85,8 @@ jobs:
       - name: 类型检查
         run: npx tsc --noEmit
 
+      - name: 源码 lint
+        run: pnpm lint
+
       - name: 构建产物
         run: pnpm build

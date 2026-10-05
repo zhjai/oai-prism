@@ -145,6 +145,7 @@ func applyHeaderOverrides(r *http.Request, model, effort *string) (accountID, pr
 	}
 	accountID = strings.TrimSpace(r.Header.Get(HeaderAccount))
 	projectID = strings.TrimSpace(r.Header.Get(HeaderProject))
+	middleware.RecordLogModel(r, *model)
 	return
 }
 
