@@ -6,32 +6,23 @@ import type {
   IChatRepository,
   SendMessageOptions,
 } from '../../domain/chat/entity';
-import { compareModelNewestFirst, pickMainModels } from '../../domain/modelFilter';
+import { pickMainModels } from '../../domain/modelFilter';
 import { getApiKey, httpClient } from '../http/client';
 
 export class ChatRepositoryImpl implements IChatRepository {
-  async fetchModelCatalog(): Promise<{ mains: ChatModelInfo[]; allIds: string[] }> {
-    try {
-      const res = await httpClient.get<any>('/v1/models');
-      const data = res.data?.data || [];
-      if (Array.isArray(data) && data.length > 0) {
-        // 后端 /v1/models 已只暴露现役模型（含各自主模型的档位变体）。
-        // mains = 不带档位后缀的条目；allIds 全量保留 —— 各模型的可用推理档位
-        // 由其 effort 变体是否存在推导（domain/modelFilter.ts）。
-        const mains = pickMainModels(data).sort(compareModelNewestFirst);
-        if (mains.length > 0) {
-          return {
-            mains: mains.map((m: any) => ({ id: m.id, name: m.name || m.id })),
-            allIds: data.map((m: any) => m.id),
-          };
-        }
-      }
-    } catch {
-      // 容灾兜底：后端不可达时仅保旗舰，避免空 UI
-    }
+  async fetchModelCatalog(accountId = ''): Promise<{ mains: ChatModelInfo[]; allIds: string[] }> {
+    const res = await httpClient.get<any>('/v1/models', {
+      headers: accountId ? { 'X-Oaiprism-Account': accountId } : {},
+    });
+    const data = res.data?.data;
+    if (!Array.isArray(data)) throw new Error('模型目录响应无效');
+    const mains = pickMainModels(data);
+    // Preserve the upstream order and the backend's selected default.
+    const defaultModel = data.find((m: any) => m.default)?.upstream_model;
+    mains.sort((a: any, b: any) => Number(b.id === defaultModel) - Number(a.id === defaultModel));
     return {
-      mains: [{ id: 'gpt-6.1-sol', name: '6.1 Sol' }],
-      allIds: ['gpt-6.1-sol', 'gpt-6.1-sol-low', 'gpt-6.1-sol-high', 'gpt-6.1-sol-xhigh'],
+      mains: mains.map((m: any) => ({ id: m.id, name: m.name || m.id, reasoningEfforts: m.reasoning_efforts, defaultReasoningEffort: m.default_reasoning_effort || m.reasoning_effort })),
+      allIds: data.map((m: any) => m.id),
     };
   }
 
@@ -39,38 +30,6 @@ export class ChatRepositoryImpl implements IChatRepository {
     try {
       const res = await httpClient.get<any[]>('/admin/chat/sessions');
       const list = res.data || [];
-
-      if (list.length === 0) {
-        // 后端无会话记录，在 SQLite 初始化默认引导会话
-        const defaultSession: ChatSession = {
-          id: 'sess_default_playground',
-          title: '6.1 Sol 调试会话',
-          model: 'gpt-6.1-sol',
-          reasoningEffort: 'medium',
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-          messages: [
-            {
-              id: 'msg_sys_intro',
-              role: 'assistant',
-              content: '你好！我是接入 OAIprism 代理网关的 Codex AI 助手（当前使用 **6.1 Sol**）。对话与调试记录已在服务端 SQLite 持久化，请随时发送测试请求！',
-              createdAt: new Date().toISOString(),
-              status: 'success',
-            },
-          ],
-        };
-        await this.saveSession(defaultSession);
-        // 引导欢迎语单独入库（消息持久化已从 saveSession 中拆出，
-        // 见 saveSession 注释 —— 否则每次完成流式都会全量重插）。
-        await httpClient.post(`/admin/chat/sessions/${defaultSession.id}/messages`, {
-          id: defaultSession.messages[0].id,
-          role: defaultSession.messages[0].role,
-          content: defaultSession.messages[0].content,
-          reasoning: '',
-          status: 'success',
-        });
-        return [defaultSession];
-      }
 
       // 获取每个会话的消息历史
       const sessionsWithMessages = await Promise.all(

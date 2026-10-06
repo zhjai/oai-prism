@@ -59,10 +59,10 @@ async function sleep(ms) {
 async function runPrompt(convId, projId, sbUrl, sbTok, prevRespId, snapshot, inputItems) {
   const reqBody = {
     conversationId: convId,
-    model: "gpt-6.1-sol",
+    model: "gpt-5.6-sol",
     metadata: {
       projectId: projId,
-      model: "gpt-6.1-sol",
+      model: "gpt-5.6-sol",
       reasoning_effort: "low",
       frontend_origin: "https://prism.openai.com",
       sandbox_url: sbUrl,

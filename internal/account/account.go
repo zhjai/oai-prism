@@ -274,6 +274,8 @@ func (a *Account) Inflight() int64 { return a.inflight.Load() }
 // MaxConcurrency 并发上限，0 表示不限。
 func (a *Account) MaxConcurrency() int64 { return a.maxConc.Load() }
 
+func (a *Account) IsEnabled() bool { return a.enabled.Load() }
+
 // Available 判断账号当前是否可被调度。
 // Busy 报告账号是否"仅因并发已满而暂不可用"（未冷却且凭据可用）。
 func (a *Account) Busy(now time.Time) bool {
@@ -369,6 +371,10 @@ func (a *Account) MarkSuccess() {
 
 // MarkAuthFailed 记录"凭据失效"。
 func (a *Account) MarkAuthFailed() { a.authFailed.Store(true) }
+
+// MarkAuthenticated clears the authentication flag after a credential probe.
+// Only successful inference resets the inference failure streak and cooldown.
+func (a *Account) MarkAuthenticated() { a.authFailed.Store(false) }
 
 // AuthFailed 报告该账号当前是否处于"凭据失效"状态。
 func (a *Account) AuthFailed() bool { return a.authFailed.Load() }

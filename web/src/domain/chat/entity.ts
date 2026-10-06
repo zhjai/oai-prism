@@ -5,9 +5,11 @@
 export interface ChatModelInfo {
   id: string;
   name: string;
+  reasoningEfforts?: ReasoningEffort[];
+  defaultReasoningEffort?: ReasoningEffort;
 }
 
-export type ReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh';
+export type ReasoningEffort = string;
 
 /** 一轮推理的 token 用量（OpenAI include_usage 语义） */
 export interface ChatUsage {
@@ -70,7 +72,7 @@ export interface SendMessageOptions {
 }
 
 export interface IChatRepository {
-  fetchModelCatalog(): Promise<{ mains: ChatModelInfo[]; allIds: string[] }>;
+  fetchModelCatalog(accountId?: string): Promise<{ mains: ChatModelInfo[]; allIds: string[] }>;
   sendMessageStream(options: SendMessageOptions): Promise<void>;
   listSessions(): Promise<ChatSession[]>;
   saveSession(session: ChatSession): Promise<void>;

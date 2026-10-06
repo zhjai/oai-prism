@@ -69,7 +69,7 @@ async function run() {
   // 轮 1: 要求执行命令
   console.log("\n--- [轮 1] 要求在本地执行命令创建 demo_prism.txt ---");
   const p1 = {
-    model: "gpt-6.1-sol",
+    model: "gpt-5.6-sol",
     stream: true,
     tools: tools,
     input: [
@@ -100,7 +100,7 @@ async function run() {
   ];
 
   const p2 = {
-    model: "gpt-6.1-sol",
+    model: "gpt-5.6-sol",
     stream: true,
     tools: tools,
     input: input2

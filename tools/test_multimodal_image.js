@@ -21,7 +21,7 @@ async function testMultimodal() {
   console.log(`准备发送图片: ${testDescription}, base64 长度: ${b64ToSend.length}`);
 
   const payload = {
-    model: "gpt-6.1-sol",
+    model: "gpt-5.6-sol",
     stream: false,
     input: [
       {

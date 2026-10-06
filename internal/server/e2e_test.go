@@ -490,6 +490,7 @@ func newTestServer(t *testing.T, up *fakeUpstream, accounts []config.AccountConf
 	t.Cleanup(upstream.Close)
 
 	cfg := config.Default()
+	cfg.Facade.ModelCatalog.Enabled = false // Legacy fake upstream has no catalog endpoint.
 	cfg.Upstream.BaseURL = upstream.URL
 	cfg.Upstream.MaxRetries = 0 // 测试要确定性，不要内部重试干扰断言
 	cfg.Upstream.ForceHTTP2 = false

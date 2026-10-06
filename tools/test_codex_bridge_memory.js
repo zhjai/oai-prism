@@ -7,7 +7,7 @@ async function main() {
   // 第一轮：带 tools 走桥模式
   console.log("\n--- [轮 1] 发送名字和秘密暗号 ---");
   const p1 = {
-    model: "gpt-6.1-sol",
+    model: "gpt-5.6-sol",
     tools: [
       {
         type: "function",
@@ -41,7 +41,7 @@ async function main() {
   // 第二轮：多轮回传，询问上一轮内容
   console.log("\n--- [轮 2] 询问名字与专属暗号 ---");
   const p2 = {
-    model: "gpt-6.1-sol",
+    model: "gpt-5.6-sol",
     tools: p1.tools,
     input: [
       { role: "user", content: "我叫极光特工，我的专属暗号是【雪顶冰咖啡】。请直接回复收到即可，不需要执行任何命令。" },

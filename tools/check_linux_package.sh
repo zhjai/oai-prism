@@ -51,7 +51,9 @@ if [[ "$healthy" != true ]]; then
 fi
 test "$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' "$url/readyz")" = 503
 curl -fsS --max-time 5 "$url/v1/models" >"$work/models.json"
-grep -q 'gpt-6.1-sol' "$work/models.json"
+# A fresh package has no credentials, so the dynamic catalog must be empty.
+grep -Fq '"object":"list"' "$work/models.json"
+grep -Fq '"data":[]' "$work/models.json"
 curl -fsS --max-time 5 "$url/dashboard/" >"$work/dashboard.html"
 cmp "$root/web/dist/index.html" "$work/dashboard.html"
 for asset in "$root/web/dist/assets/"*.js "$root/web/dist/assets/"*.css; do

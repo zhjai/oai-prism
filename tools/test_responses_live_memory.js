@@ -7,7 +7,7 @@ async function main() {
   // 第一轮
   console.log("\n--- [轮 1] 发送名字和秘密暗号 ---");
   const p1 = {
-    model: "gpt-6.1-sol",
+    model: "gpt-5.6-sol",
     input: [
       { role: "user", content: "我叫极光特工，我的专属暗号是【北极星007】。请确认记住。" }
     ]
@@ -27,7 +27,7 @@ async function main() {
   // 第二轮（多轮回传模式，模拟真实 Codex 客户端）
   console.log("\n--- [轮 2] 询问名字与暗号 ---");
   const p2 = {
-    model: "gpt-6.1-sol",
+    model: "gpt-5.6-sol",
     input: [
       { role: "user", content: "我叫极光特工，我的专属暗号是【北极星007】。请确认记住。" },
       { role: "assistant", content: r1.output ? r1.output[0].content[0].text : "已记住。" },

@@ -4,6 +4,7 @@ import { effortsForModel } from '../../domain/modelFilter';
 import { ChatRepositoryImpl } from '../../infrastructure/repositories/chat.repo.impl';
 
 const repo = new ChatRepositoryImpl();
+let catalogRequest = 0;
 
 const newId = (prefix: string) => `${prefix}_${Array.from(crypto.getRandomValues(new Uint32Array(4)), (part) => part.toString(16).padStart(8, '0')).join('')}`;
 
@@ -17,9 +18,12 @@ interface ChatState {
   selectedAccountId: string;
   isStreaming: boolean;
   lastUsage: ChatUsage | null; // 本轮 token 用量（上下文窗口可视化）
+  catalogError: string;
+  isCatalogLoading: boolean;
 
   // Actions
   init: () => Promise<void>;
+  refreshModels: () => Promise<void>;
   selectSession: (id: string) => void;
   createNewSession: () => void;
   deleteSession: (id: string) => Promise<void>;
@@ -35,34 +39,57 @@ export const useChatStore = create<ChatState>((set, get) => ({
   allModelIds: [],
   sessions: [],
   currentSessionId: null,
-  selectedModel: 'gpt-6.1-sol',
+  selectedModel: '',
   reasoningEffort: 'medium',
   selectedAccountId: '',
   isStreaming: false,
   lastUsage: null,
+  catalogError: '',
+  isCatalogLoading: false,
 
   init: async () => {
-    const [{ mains, allIds }, sessions] = await Promise.all([
-      repo.fetchModelCatalog(),
-      repo.listSessions(),
-    ]);
+    const sessions = await repo.listSessions();
     const defaultSessionId = sessions[0]?.id || null;
     set({
-      models: mains,
-      allModelIds: allIds,
       sessions,
       currentSessionId: defaultSessionId,
       selectedAccountId: sessions[0]?.accountId || '',
-      selectedModel: mains[0]?.id || 'gpt-6.1-sol',
-      // 兜底：默认档位若不在新模型的可用列表里，回落 medium
-      reasoningEffort: effortsForModel(mains[0]?.id || 'gpt-6.1-sol', allIds).includes('medium')
-        ? 'medium'
-        : (effortsForModel(mains[0]?.id || 'gpt-6.1-sol', allIds)[0] ?? 'medium'),
+      selectedModel: sessions[0]?.model || '',
+      reasoningEffort: sessions[0]?.reasoningEffort || 'medium',
     });
+    await get().refreshModels();
+    if (!get().sessions.length && get().selectedModel) get().createNewSession();
+  },
+
+  refreshModels: async () => {
+    if (get().isStreaming) return;
+    const request = ++catalogRequest;
+    const accountId = get().selectedAccountId;
+    set({ isCatalogLoading: true, catalogError: '' });
+    try {
+      const { mains, allIds } = await repo.fetchModelCatalog(accountId);
+      if (request !== catalogRequest) return;
+      const previous = get().selectedModel;
+      const selectedModel = previous || mains[0]?.id || '';
+      const available = effortsForModel(selectedModel, allIds, mains.find((m) => m.id === selectedModel)?.reasoningEfforts);
+      const preferred = mains.find((m) => m.id === selectedModel)?.defaultReasoningEffort;
+      set({
+        models: mains, allModelIds: allIds, selectedModel,
+        reasoningEffort: available.includes(get().reasoningEffort) ? get().reasoningEffort : (preferred && available.includes(preferred) ? preferred : available[0] || 'medium'),
+        catalogError: !mains.length ? '当前账号范围没有可用模型，请检查账号状态和 Key 绑定' : (previous && !mains.some((m) => m.id === previous) ? '之前的模型已不可用，请重新选择模型' : ''),
+        isCatalogLoading: false,
+      });
+      if (!get().sessions.length && selectedModel) get().createNewSession();
+    } catch (err: any) {
+      if (request !== catalogRequest) return;
+      set({ models: [], allModelIds: [], isCatalogLoading: false, catalogError: err.message || '模型目录获取失败' });
+    }
   },
 
   selectSession: (id: string) => {
-    set({ currentSessionId: id, selectedAccountId: get().sessions.find((s) => s.id === id)?.accountId || '' });
+    const session = get().sessions.find((s) => s.id === id);
+    set({ currentSessionId: id, selectedAccountId: session?.accountId || '', selectedModel: session?.model || '', reasoningEffort: session?.reasoningEffort || 'medium' });
+    void get().refreshModels();
   },
 
   createNewSession: () => {
@@ -85,7 +112,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
     await repo.deleteSession(id);
     const sessions = get().sessions.filter((s) => s.id !== id);
     const nextId = sessions[0]?.id || null;
-    set({ sessions, currentSessionId: nextId, selectedAccountId: sessions[0]?.accountId || '' });
+    set({ sessions, currentSessionId: nextId, selectedAccountId: sessions[0]?.accountId || '', selectedModel: sessions[0]?.model || '' });
+    void get().refreshModels();
   },
 
   renameSession: (id: string, title: string) => {
@@ -102,11 +130,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
   setModel: (model: string) => {
     // 切换模型时校验当前推理档位：新模型不支持则回落 medium
     // （各模型的档位由后端配置决定，如 6 Luna 没有 low）
-    const { allModelIds, reasoningEffort } = get();
-    const available = effortsForModel(model, allModelIds);
+    const { allModelIds, reasoningEffort, models } = get();
+    const available = effortsForModel(model, allModelIds, models.find((m) => m.id === model)?.reasoningEfforts);
+    const preferred = models.find((m) => m.id === model)?.defaultReasoningEffort;
     set({
       selectedModel: model,
-      reasoningEffort: available.includes(reasoningEffort) ? reasoningEffort : 'medium',
+      reasoningEffort: available.includes(reasoningEffort) ? reasoningEffort : (preferred && available.includes(preferred) ? preferred : available[0] || 'medium'),
+      catalogError: '',
     });
   },
 
@@ -119,11 +149,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set({ selectedAccountId: id, sessions });
     const updated = sessions.find((s) => s.id === get().currentSessionId);
     if (updated) void repo.saveSession(updated);
+    void get().refreshModels();
   },
 
   sendMessage: async (text: string, attachments?: ChatAttachment[]) => {
     const { currentSessionId, selectedModel, reasoningEffort, selectedAccountId, sessions } = get();
-    if (!text.trim() || !currentSessionId || get().isStreaming) return;
+    if (!text.trim() || !currentSessionId || get().isStreaming || get().isCatalogLoading || !get().models.some((m) => m.id === selectedModel)) return;
 
     const session = sessions.find((s) => s.id === currentSessionId);
     if (!session) return;
@@ -151,6 +182,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const updatedMessages = [...session.messages, userMsg, assistantMsg];
     const updatedSession: ChatSession = {
       ...session,
+      model: selectedModel,
+      reasoningEffort,
       title: session.messages.length === 0 ? text.slice(0, 18) : session.title,
       messages: updatedMessages,
       updatedAt: new Date().toISOString(),

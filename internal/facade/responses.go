@@ -93,9 +93,16 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(effort) == "" {
 		effort = metadataEffort(rawFields)
 	}
-	model, resolvedEffort := h.resolveModel(req.Model, effort)
-	effort = resolvedEffort
+	model := req.Model
 	accountID, projectID := applyHeaderOverrides(r, &model, &effort)
+	effortExplicit := strings.TrimSpace(effort) != ""
+	model, effort = h.resolveModel(model, effort)
+	var modelOK bool
+	r, modelOK = h.prepareModel(w, r, &model, &effort, strings.TrimSpace(req.Model) == "" && strings.TrimSpace(r.Header.Get(HeaderModel)) == "", effortExplicit)
+	if !modelOK {
+		return
+	}
+	req.Model = responseModel(r, req.Model, model)
 
 	// 工具桥：Codex CLI 把工具声明放在 input 的 additional_tools 条目里
 	// （顶层 tools 为 null）。检测到它就切换到桥模式 —— 上游当大脑，
@@ -265,6 +272,9 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 // dispatchResponses 按 stream 字段分派。
 func (h *Handler) dispatchResponses(w http.ResponseWriter, r *http.Request, runReq *RunRequest, turn *responsesTurn) {
+	if !verifyCatalogContinuity(w, r, runReq) {
+		return
+	}
 	if turn.stream {
 		h.streamResponses(w, r, runReq, turn)
 		return

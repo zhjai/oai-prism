@@ -106,7 +106,7 @@ case "$(uname -m)" in
   aarch64|arm64) arch=arm64 ;;
   *) echo "不支持的架构：$(uname -m)"; exit 1 ;;
 esac
-version=v0.1.0-zhjai.5
+version=v0.1.0-zhjai.7
 asset="oaiprism-${version}-linux-${arch}.tar.gz"
 url="https://github.com/zhjai/oai-prism/releases/download/${version}"
 curl -fLO "${url}/${asset}"
@@ -173,7 +173,7 @@ go build -o oaiprism.exe ./cmd/oaiprism
 curl http://127.0.0.1:8787/v1/chat/completions \
   -H "Authorization: Bearer $OAIPRISM_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gpt-6.1-sol","stream":true,"messages":[{"role":"user","content":"你好"}]}'
+  -d '{"model":"gpt-5.6-sol","stream":true,"messages":[{"role":"user","content":"你好"}]}'
 ```
 
 ## 接入客户端
@@ -182,7 +182,7 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 
 ```toml
 model_provider = "oaiprism"
-model = "gpt-6.1-sol"
+model = "gpt-5.6-sol"
 model_context_window = 1000000
 
 [model_providers.oaiprism]
@@ -201,7 +201,7 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:8787/v1", api_key="<你的 Key>")
 resp = client.chat.completions.create(
-    model="gpt-6.1-sol",
+    model="gpt-5.6-sol",
     messages=[{"role": "user", "content": "你好"}],
 )
 print(resp.choices[0].message.content)
@@ -217,7 +217,7 @@ import anthropic
 
 client = anthropic.Anthropic(base_url="http://127.0.0.1:8787", api_key="<你的 Key>")
 msg = client.messages.create(
-    model="gpt-6.1-sol",
+    model="gpt-5.6-sol",
     max_tokens=1024,
     messages=[{"role": "user", "content": "你好"}],
 )
@@ -231,12 +231,21 @@ print(msg.content[0].text)
 
 | 模型 | 推理强度变体 |
 |---|---|
-| `gpt-6.1-sol`（默认） | `-low` / `-high` / `-xhigh` |
 | `gpt-6-luna` | `-high` / `-xhigh` |
-| `gpt-5.6-sol` | `-low` / `-high` / `-xhigh` |
+| `gpt-5.6-sol`（默认） | `-low` / `-high` / `-xhigh` |
 | `gpt-5.6-terra` | `-high` / `-xhigh` |
 
-以 `GET /v1/models` 为准，映射表在 `facade.models` 中可按需增删。
+上表为 2026-10-06 实测；`gpt-6.1-sol` 已下架。请以当前 Key 的 `GET /v1/models` 返回为准：
+
+```bash
+curl http://127.0.0.1:8787/v1/models \
+  -H "Authorization: Bearer $OAIPRISM_KEY"
+# 查询指定账号时加：-H "X-Oaiprism-Account: <账号 ID>"
+```
+
+网关按账号查询 Prism 的 `/api/inference/models`，只合并当前 Key 可调度账号的目录。停用和冷却中的账号不会提供模型；认证失败的账号会在冷却后重新校验，并发已满的账号仍显示其目录。部分账号查询失败时只返回成功账号的结果；全部失败返回 `503 model_catalog_unavailable`。推理请求的模型若只可能由暂时不可用的账号提供，也返回可重试的 503，避免把冷却或网络故障误报为模型下架。目录 401 会触发凭据刷新，429 会遵守账号冷却。缓存默认 5 分钟，可通过 `facade.model_catalog.refresh_interval` 调整，刷新失败不会返回过期目录。
+
+`facade.models` 用于配置别名和推理强度；目标模型下架后别名也隐藏。显式请求不可用模型返回 `404 model_not_found`，不会换成另一模型；仅省略模型时，过期的默认值会改用目录中的第一个。新模型会自动进入列表。自定义上游没有目录接口时，可显式设置 `facade.model_catalog.enabled: false` 使用静态映射。
 
 </details>
 
@@ -338,7 +347,7 @@ cd web && pnpm install && npx tsc --noEmit && pnpm build
 - CI 在任意分支 push / PR 时运行 Go 门禁（vet → test → race → 构建 → 交叉编译 linux/amd64、arm64）
   与 Dashboard 门禁（tsc → vite build）。
 - 推送 `v*` 标签触发 Release 工作流：完成 Go 与 Dashboard 门禁后，为 Linux amd64/arm64 打包并生成 `SHA256SUMS`。
-  本地等价打包命令：`./tools/package_linux.sh v0.1.0-zhjai.5`，产物位于 `dist/`。
+  本地等价打包命令：`./tools/package_linux.sh v0.1.0-zhjai.7`，产物位于 `dist/`。
 
 欢迎提交 Issue 与 Pull Request。较大的改动请先开 Issue 讨论方向。
 

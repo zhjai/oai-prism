@@ -37,9 +37,16 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	if strings.TrimSpace(effort) == "" {
 		effort = metadataEffort(rawFields)
 	}
-	model, resolvedEffort := h.resolveModel(req.Model, effort)
-	effort = resolvedEffort
+	model := req.Model
 	accountID, projectID := applyHeaderOverrides(r, &model, &effort)
+	effortExplicit := strings.TrimSpace(effort) != ""
+	model, effort = h.resolveModel(model, effort)
+	var modelOK bool
+	r, modelOK = h.prepareModel(w, r, &model, &effort, strings.TrimSpace(req.Model) == "" && strings.TrimSpace(r.Header.Get(HeaderModel)) == "", effortExplicit)
+	if !modelOK {
+		return
+	}
+	req.Model = responseModel(r, req.Model, model)
 
 	runReq := &RunRequest{
 		Model:        model,
@@ -57,6 +64,9 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	// 原生续接：会话历史由上游保管，续接轮次只发增量（见 native.go）。
 	if conv := chatConversation(req.Messages, h.cfg.Facade.DefaultSystemPrompt); conv != nil {
 		h.attachNative(runReq, &nativeTurn{key: runReq.StickyKey, strong: isStrongSessionKey(runReq.StickyKey), conv: conv})
+	}
+	if !verifyCatalogContinuity(w, r, runReq) {
+		return
 	}
 
 	// 超过上游单条上限：流开始之前就以 400 context_length_exceeded 回绝（见 context_limit.go）。

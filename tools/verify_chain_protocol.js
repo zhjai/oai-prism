@@ -77,10 +77,10 @@ async function sleep(ms) {
   console.log("\n=== 2. 发起第一轮请求 ===");
   const start1 = await postJSON("/api/llm/response_with_tools_start", {
     conversationId: convId,
-    model: "gpt-6.1-sol",
+    model: "gpt-5.6-sol",
     metadata: {
       projectId: projId,
-      model: "gpt-6.1-sol",
+      model: "gpt-5.6-sol",
       reasoning_effort: "low",
       frontend_origin: "https://prism.openai.com",
       sandbox_url: sbUrl,
@@ -146,10 +146,10 @@ async function sleep(ms) {
   const start2 = await postJSON("/api/llm/response_with_tools_start", {
     conversationId: convId,
     previousResponseId: respId1,
-    model: "gpt-6.1-sol",
+    model: "gpt-5.6-sol",
     metadata: {
       projectId: projId,
-      model: "gpt-6.1-sol",
+      model: "gpt-5.6-sol",
       reasoning_effort: "low",
       frontend_origin: "https://prism.openai.com",
       sandbox_url: sbUrl,

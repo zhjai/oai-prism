@@ -267,6 +267,10 @@ type FacadeConfig struct {
 	// 例：gpt-5-codex-fast -> {model: gpt-5, effort: high}
 	Models map[string]ModelMapping `yaml:"models"`
 
+	// ModelCatalog synchronizes the account-specific upstream directory. Disable
+	// only for custom upstreams that do not implement /api/inference/models.
+	ModelCatalog ModelCatalogConfig `yaml:"model_catalog"`
+
 	// 上游协议字段名——留成可配置是因为这套内部 API 会变，
 	// 改字段不该逼着重新编译。
 	Schema SchemaConfig `yaml:"schema"`
@@ -522,15 +526,9 @@ func Default() *Config {
 		Facade: FacadeConfig{
 			Enabled:      true,
 			DefaultModel: DefaultPrismModel,
-			// 内置清单 = 4 个现役模型 x 各自的推理档位，与 configs/config.yaml 保持一致。
-			// 已下线模型（astra 系）与历史别名（gpt-5、短别名等）不再内置 —— 以
-			// Statsig prism_codex_models 实测清单为准，维护时同步改这里和 yaml。
+			ModelCatalog: ModelCatalogConfig{Enabled: true, RefreshInterval: 5 * time.Minute},
+			// 本地别名仅在账号上游目录仍包含目标模型时才公布。
 			Models: map[string]ModelMapping{
-				// 6.1 Sol（当前旗舰）
-				"gpt-6.1-sol":       {Model: "gpt-6.1-sol", ReasoningEffort: "medium", Label: "6.1 Sol"},
-				"gpt-6.1-sol-low":   {Model: "gpt-6.1-sol", ReasoningEffort: "low", Label: "6.1 Sol (Low)"},
-				"gpt-6.1-sol-high":  {Model: "gpt-6.1-sol", ReasoningEffort: "high", Label: "6.1 Sol (High)"},
-				"gpt-6.1-sol-xhigh": {Model: "gpt-6.1-sol", ReasoningEffort: "xhigh", Label: "6.1 Sol (Extra High)"},
 				// 6 Luna
 				"gpt-6-luna":       {Model: "gpt-6-luna", ReasoningEffort: "medium", Label: "6 Luna"},
 				"gpt-6-luna-high":  {Model: "gpt-6-luna", ReasoningEffort: "high", Label: "6 Luna (High)"},
@@ -694,14 +692,14 @@ const DefaultFacadeMaxPromptBytes = 96 << 10
 
 // DefaultPrismModel 是上游对话模型的默认值。
 //
-// 来自前端 bundle 里的 `let n="gpt-5.6-sol"`（UI 显示为 "5.6 Sol"）。
-// 真实可用列表由 Statsig 开关 prism_codex_models 动态下发，
-// 因此这个值可能随上游灰度变化 —— 变更时改配置即可，不用改代码。
-// 清单来源：Statsig 动态配置 prism_codex_models（2026-10 实测）。
-// 上游会下线/新增模型：gpt-6-astra 已下线（上游路由到
-// codex_v2_restore_start 并返回 400，无创建入口），
-// gpt-6.1-sol / gpt-6-luna 为当前在售。维护时以该配置为准。
-const DefaultPrismModel = "gpt-6.1-sol"
+// 省略模型时优先使用此值；若不在账号目录，则选目录中的第一个。
+// 显式请求的模型不做替换。实际目录来自 GET /api/inference/models。
+const DefaultPrismModel = "gpt-5.6-sol"
+
+type ModelCatalogConfig struct {
+	Enabled         bool          `yaml:"enabled"`
+	RefreshInterval time.Duration `yaml:"refresh_interval"`
+}
 
 const (
 	// DefaultUserAgent 与 Codex CLI 保持一致的形态，避免被上游按"未知客户端"降级。

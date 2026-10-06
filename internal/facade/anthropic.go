@@ -37,8 +37,16 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	model, effort := h.resolveModel(req.Model, "")
+	model, effort := req.Model, ""
 	accountID, projectID := applyHeaderOverrides(r, &model, &effort)
+	effortExplicit := strings.TrimSpace(effort) != ""
+	model, effort = h.resolveModel(model, effort)
+	var modelOK bool
+	r, modelOK = h.prepareModel(w, r, &model, &effort, strings.TrimSpace(req.Model) == "" && strings.TrimSpace(r.Header.Get(HeaderModel)) == "", effortExplicit)
+	if !modelOK {
+		return
+	}
+	req.Model = responseModel(r, req.Model, model)
 
 	// Anthropic 把 system 放在顶层字段：交给翻译层当 system，与折叠的历史
 	// 合成唯一一条（上游只读最后一条 system；单独前插一条的话，客户端自带的
@@ -64,6 +72,9 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	// 原生续接：会话历史由上游保管，续接轮次只发增量（见 native.go）。
 	if conv := chatConversation(anthropicChatMessages(req.Messages), sys); conv != nil {
 		h.attachNative(runReq, &nativeTurn{key: runReq.StickyKey, strong: isStrongSessionKey(runReq.StickyKey), conv: conv})
+	}
+	if !verifyCatalogContinuity(w, r, runReq) {
+		return
 	}
 
 	// 超过上游单条上限：在 message_start 之前以 400 "prompt is too long" 回绝 ——

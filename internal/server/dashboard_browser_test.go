@@ -44,3 +44,20 @@ func TestDashboardBrowserBootstrap(t *testing.T) {
 	}
 	t.Log(string(output))
 }
+
+func TestDashboardModelCatalogBrowser(t *testing.T) {
+	if os.Getenv("OAIPRISM_BROWSER_TEST") != "1" {
+		t.Skip("opt-in Playwright verification")
+	}
+	ts, _ := newTestServer(t, &fakeUpstream{t: t}, []config.AccountConfig{
+		{ID: "a", Name: "Account A", AccessToken: "test-token-a"},
+		{ID: "b", Name: "Account B", AccessToken: "test-token-b"},
+	}, func(c *config.Config) { c.Facade.APIKeys = []string{"browser-test-admin-key"} })
+	cmd := exec.Command("node", filepath.Join("..", "..", "tools", "test_dashboard_models.mjs"))
+	cmd.Env = append(os.Environ(), "OAIPRISM_BROWSER_URL="+ts.URL)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("browser model catalog verification: %v\n%s", err, output)
+	}
+	t.Log(string(output))
+}

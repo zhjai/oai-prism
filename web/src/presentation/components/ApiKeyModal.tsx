@@ -455,7 +455,7 @@ const ApiKeyDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => {
   -H "Content-Type: application/json" \\
   -H "Authorization: Bearer ${firstKey}" \\
   -d '{
-    "model": "gpt-6.1-sol",
+    "model": "gpt-5.6-sol",
     "messages": [{"role": "user", "content": "你好！"}]
   }'`;
 
@@ -467,14 +467,14 @@ client = OpenAI(
 )
 
 resp = client.chat.completions.create(
-    model="gpt-6.1-sol",
+    model="gpt-5.6-sol",
     messages=[{"role": "user", "content": "你好！"}]
 )
 print(resp.choices[0].message.content)`;
 
   const codexExample = `# ~/.codex/config.toml
 model_provider = "oaiprism"
-model = "gpt-6.1-sol"
+model = "gpt-5.6-sol"
 model_context_window = 16384
 
 [model_providers.oaiprism]

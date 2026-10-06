@@ -39,7 +39,7 @@ case "$(uname -m)" in
   aarch64|arm64) arch=arm64 ;;
   *) echo "不支持的架构：$(uname -m)"; exit 1 ;;
 esac
-version=v0.1.0-zhjai.5
+version=v0.1.0-zhjai.7
 asset="oaiprism-${version}-linux-${arch}.tar.gz"
 url="https://github.com/zhjai/oai-prism/releases/download/${version}"
 curl -fLO "${url}/${asset}"
@@ -86,7 +86,7 @@ cd ..
 ```
 
 交叉编译：`make build-linux` 生成 `bin/oaiprism-linux-amd64` 和 `bin/oaiprism-linux-arm64`。
-生成与 Release 相同的完整安装包：`./tools/package_linux.sh v0.1.0-zhjai.5`，输出在 `dist/`。
+生成与 Release 相同的完整安装包：`./tools/package_linux.sh v0.1.0-zhjai.7`，输出在 `dist/`。
 
 如果后续使用本教程提供的 systemd 单元，请把完整运行目录放到 `~/.local/share/oaiprism`，
 或按实际位置修改单元的 `WorkingDirectory` 和 `ExecStart`。
@@ -165,7 +165,7 @@ curl -fsS http://127.0.0.1:8787/v1/models \
 curl -N http://127.0.0.1:8787/v1/chat/completions \
   -H "Authorization: Bearer $OAIPRISM_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gpt-6.1-sol","stream":true,"messages":[{"role":"user","content":"你好"}]}'
+  -d '{"model":"gpt-5.6-sol","stream":true,"messages":[{"role":"user","content":"你好"}]}'
 ```
 
 客户端接入配置见 [README](../README.md#接入客户端) 和 [使用指南](使用指南.md#接入客户端)。

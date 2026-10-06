@@ -1,0 +1,1 @@
+var e=e=>/-(low|medium|high|xhigh)$/.test(e),t=e=>e.replace(/-(low|medium|high|xhigh)$/,``),n=t=>t.filter(t=>t.upstream_model?t.id===t.upstream_model:!e(t.id)),r=(e,t,n)=>{if(n?.length)return n;let r=n=>t.includes(e+n);return[...r(`-low`)?[`low`]:[],`medium`,...r(`-high`)?[`high`]:[],...r(`-xhigh`)?[`xhigh`]:[]]};export{n,t as r,r as t};

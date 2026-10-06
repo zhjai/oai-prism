@@ -21,10 +21,11 @@ import (
 
 // Handler 是兼容门面的 HTTP 层。
 type Handler struct {
-	cfg    *config.Config
-	log    *slog.Logger
-	runner *Runner
-	app    *metrics.App
+	cfg     *config.Config
+	log     *slog.Logger
+	runner  *Runner
+	app     *metrics.App
+	catalog modelCatalog
 }
 
 // NewHandler 构造门面处理器。
@@ -125,10 +126,13 @@ func (h *Handler) resolveModel(requested, effort string) (model string, outEffor
 	outEffort = strings.TrimSpace(effort)
 
 	if m, ok := f.Models[model]; ok {
+		alias := m.Model != "" && m.Model != model
 		if m.Model != "" {
 			model = m.Model
 		}
-		if outEffort == "" && m.ReasoningEffort != "" {
+		// In dynamic mode the base model's default comes from its catalog.
+		// A named alias remains an explicit choice of its configured effort.
+		if outEffort == "" && m.ReasoningEffort != "" && (!f.ModelCatalog.Enabled || alias) {
 			outEffort = m.ReasoningEffort
 		}
 	}
@@ -147,6 +151,18 @@ func applyHeaderOverrides(r *http.Request, model, effort *string) (accountID, pr
 	projectID = strings.TrimSpace(r.Header.Get(HeaderProject))
 	middleware.RecordLogModel(r, *model)
 	return
+}
+
+// responseModel keeps explicit public aliases while reporting the chosen model
+// when the request omitted it or supplied an overriding model header.
+func responseModel(r *http.Request, requested, resolved string) string {
+	if model := strings.TrimSpace(r.Header.Get(HeaderModel)); model != "" {
+		return model
+	}
+	if model := strings.TrimSpace(requested); model != "" {
+		return model
+	}
+	return resolved
 }
 
 // bindLogResult 把本次运行实际使用的账号与 token 用量记进审计上下文。

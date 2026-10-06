@@ -37,7 +37,6 @@ const EFFORT_LABELS: Record<ReasoningEffort, string> = {
   high: '高 (High)',
   xhigh: '极高 (xHigh)',
 };
-const EFFORT_ORDER: ReasoningEffort[] = ['low', 'medium', 'high', 'xhigh'];
 
 
 export const ChatPlaygroundPage: React.FC = () => {
@@ -53,6 +52,9 @@ export const ChatPlaygroundPage: React.FC = () => {
     isStreaming,
     lastUsage,
     init,
+    refreshModels,
+    catalogError,
+    isCatalogLoading,
     selectSession,
     createNewSession,
     deleteSession,
@@ -79,6 +81,14 @@ export const ChatPlaygroundPage: React.FC = () => {
   }, [init]);
 
   useEffect(() => {
+    const load = () => void refreshModels();
+    const unsubscribe = onCredentialChange(load);
+    window.addEventListener('focus', load);
+    const timer = window.setInterval(load, 60000);
+    return () => { unsubscribe(); window.removeEventListener('focus', load); window.clearInterval(timer); };
+  }, [refreshModels]);
+
+  useEffect(() => {
     const load = async () => {
       try {
         const res = await httpClient.get<{ accounts: AccountStats[] }>('/v1/accounts');
@@ -97,7 +107,7 @@ export const ChatPlaygroundPage: React.FC = () => {
   }, []);
 
   // 当前模型的可用推理档位（由后端清单中的档位变体推导，如 6 Luna 没有 low）
-  const availableEfforts = effortsForModel(selectedModel, allModelIds);
+  const availableEfforts = effortsForModel(selectedModel, allModelIds, models.find((m) => m.id === selectedModel)?.reasoningEfforts);
 
   // 消息区自动滚底：切换会话时直接到底；流式增量只在用户本就停在底部时跟随，
   // 往上翻阅历史时不被新内容拽回去。
@@ -126,10 +136,14 @@ export const ChatPlaygroundPage: React.FC = () => {
   const activeSession = sessions.find((s) => s.id === currentSessionId);
   const messages = activeSession?.messages || [];
   const currentModel = models.find((m) => m.id === selectedModel);
-  const effortLabel = EFFORT_LABELS[reasoningEffort];
+  const effortLabel = EFFORT_LABELS[reasoningEffort] || reasoningEffort;
 
   const handleSend = () => {
     if (!input.trim() || isStreaming) return;
+    if (isCatalogLoading || !currentModel) {
+      message.warning(catalogError || '请等待模型目录加载并选择可用模型');
+      return;
+    }
     if (selectedAccountId && !accounts.some((a) => a.id === selectedAccountId && a.enabled)) {
       message.warning('所选账号已停用、删除或不在当前 Key 的绑定范围，请重新选择');
       return;
@@ -301,11 +315,11 @@ export const ChatPlaygroundPage: React.FC = () => {
 
   // 推理强度下拉（选项随模型动态变化：各模型的档位由后端配置决定）
   const effortMenu = {
-    items: EFFORT_ORDER.filter((e) => availableEfforts.includes(e)).map((e) => ({
+    items: availableEfforts.map((e) => ({
       key: e,
       label: (
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, minWidth: 120 }}>
-          <span>{EFFORT_LABELS[e]}</span>
+          <span>{EFFORT_LABELS[e] || e}</span>
           {e === reasoningEffort && <CheckOutlined style={{ color: token.colorPrimary }} />}
         </div>
       ),
@@ -455,6 +469,7 @@ export const ChatPlaygroundPage: React.FC = () => {
 
           {/* 底部输入框（官方 Sender）：模型/强度切换与附件按钮都在输入框内，ChatGPT 式交互 */}
           <div style={{ padding: '12px 20px 16px', borderTop: `1px solid ${token.colorBorderSecondary}` }}>
+            {catalogError && <Text type="warning">{catalogError} <Button type="link" onClick={() => void refreshModels()}>刷新模型</Button></Text>}
             <Sender
               value={input}
               onChange={setInput}
@@ -508,8 +523,8 @@ export const ChatPlaygroundPage: React.FC = () => {
                     />
                   </Tooltip>
                   <Dropdown menu={modelMenu} trigger={['click']} placement="topLeft">
-                    <Button type="text" shape="round" icon={<RobotOutlined style={{ color: token.colorPrimary }} />}>
-                      {currentModel?.name || selectedModel}
+                    <Button type="text" shape="round" disabled={isStreaming || isCatalogLoading} icon={<RobotOutlined style={{ color: token.colorPrimary }} />}>
+                      {currentModel?.name || (isCatalogLoading ? '加载模型…' : '选择可用模型')}
                       <DownOutlined style={{ fontSize: 10, color: token.colorTextTertiary }} />
                     </Button>
                   </Dropdown>
