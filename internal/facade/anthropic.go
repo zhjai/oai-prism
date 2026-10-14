@@ -64,18 +64,19 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	if sys == "" {
 		sys = h.cfg.Facade.DefaultSystemPrompt
 	}
-	input := translateAnthropicMessages(req.Messages, sys, h.cfg.Facade.PromptByteLimit())
+	input := translateAnthropicMessages(req.Messages, sys, 0)
 
 	runReq := &RunRequest{
-		Model:     model,
-		Effort:    effort,
-		UserID:    anthropicUserID(rawFields),
-		Input:     input,
-		Metadata:  mergeMetadata(clientMetadata(rawFields), metadataWith("tools", anthropicToolsMetadata(req.Tools))),
-		StickyKey: anthropicConversationKey(r, rawFields, req.Messages),
-		AccountID: accountID,
-		ProjectID: projectID,
-		API:       "messages",
+		Model:           model,
+		Effort:          effort,
+		UserID:          anthropicUserID(rawFields),
+		Input:           input,
+		Metadata:        mergeMetadata(clientMetadata(rawFields), metadataWith("tools", anthropicToolsMetadata(req.Tools))),
+		StickyKey:       anthropicConversationKey(r, rawFields, req.Messages),
+		AccountID:       accountID,
+		ProjectID:       projectID,
+		API:             "messages",
+		PreserveContext: true,
 	}
 	runReq.Extra = passthroughFields(rawFields, anthropicKnownFields)
 	// 原生续接：会话历史由上游保管，续接轮次只发增量（见 native.go）。
@@ -86,7 +87,7 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// 超过上游单条上限：在 message_start 之前以 400 "prompt is too long" 回绝 ——
+	// 超过完整上下文预算：在 message_start 之前以 400 "prompt is too long" 回绝 ——
 	// Claude Code 等客户端认这句文案，据此压缩上下文（见 context_limit.go）。
 	if err := h.runner.checkPromptSize(runReq); writeAnthropicTooLarge(w, err) {
 		middleware.RecordLogError(r, "anthropic 提示词超限: %v", err)
@@ -177,6 +178,8 @@ func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, runReq
 	if err := sw.WriteRaw(buf); err != nil {
 		return
 	}
+	stopHeartbeat := streamHeartbeat(r.Context(), sw)
+	defer stopHeartbeat()
 
 	emit := func(d Delta) error {
 		// Prism previews have no Anthropic thinking signatures. Keep them out
@@ -190,12 +193,14 @@ func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, runReq
 	}
 
 	res, runErr := h.runner.Run(r.Context(), runReq, emit)
+	stopHeartbeat()
 	bindLogResult(r, res)
 
 	if runErr != nil && !errors.Is(runErr, context.Canceled) {
 		middleware.RecordLogError(r, "anthropic 流式失败: %v", runErr)
-		ev := AnthropicEvent{Type: "error", Text: runErr.Error()}
-		if errors.Is(runErr, ErrContextTooLarge) {
+		_, _, msg := mapError(runErr)
+		ev := AnthropicEvent{Type: "error", Text: msg}
+		if !errors.Is(runErr, errContextRestore) && errors.Is(runErr, ErrContextTooLarge) {
 			ev.ErrorType, ev.Text = "invalid_request_error", anthropicTooLongMessage(runErr)
 		}
 		buf = AppendAnthropicEvent(buf[:0], ev)
@@ -223,6 +228,9 @@ func (h *Handler) syncAnthropic(w http.ResponseWriter, r *http.Request, runReq *
 	res, err := h.runner.Run(r.Context(), runReq, nil)
 	bindLogResult(r, res)
 	if err != nil {
+		if writeContextRestoreFailed(w, err, "messages") {
+			return
+		}
 		if writeAnthropicTooLarge(w, err) {
 			middleware.RecordLogError(r, "anthropic 同步失败: %v", err)
 			return

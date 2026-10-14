@@ -22,28 +22,27 @@ import (
 //   - 错误码是 server_error，Codex 当断线重连（Reconnecting... 1/5、2/5…），既不压缩
 //     也不裁历史 —— 它以为窗口还很空（模型目录写的 272k），会话就此卡死。
 //
-// 所以：折叠历史时按字节预算裁掉最旧的部分（compress.go），保证放得下；连本轮内容
-// 本身（system + 最后一条 user）都放不下时，发之前就以 context_length_exceeded 失败
-// —— 客户端得到明确、不可重试的错误，而不是被当断线反复重连。Anthropic 客户端
-// （Claude Code）认 "prompt is too long"。
-//
-// 注意 Codex 0.160 收到 context_length_exceeded 只会结束本轮（"Codex ran out of room
-// in the model's context window"），并不会因此压缩，下一轮照发同样的历史（同日实测，
-// 窗口配成 272k 时也一样）—— 所以历史超限必须由网关裁，不能指望它。
+// 因此完整请求按 MaxContextBytes 接收，不裁剪历史；原生增量或完整分段后的每次
+// 物理发送按 MaxPromptBytes 检查。逻辑预算或不可分段的系统指令/目录超限时以
+// context_length_exceeded 失败。恢复出错则作废绑定，不发送裁剪后的回退请求。
 
 // ErrContextTooLarge 表示本轮提示词超过了上游单条消息上限（网关预检或上游拒绝）。
 var ErrContextTooLarge = errors.New("context_length_exceeded")
 
 // contextTooLargeError 携带超限的量化信息，errors.Is(err, ErrContextTooLarge) 成立。
 type contextTooLargeError struct {
-	Bytes     int    // 规整后 system + user 的字节数
-	Limit     int    // 生效上限（未配置时为 0）
-	Tokens    int    // 同一份内容的 token 数
-	Upstream  string // 上游拒绝时的原文；网关预检拒绝时为空
-	ConfigKey string // logical-context budget uses max_context_bytes
+	Bytes        int    // 规整后 system + user 的字节数
+	Limit        int    // 生效上限（未配置时为 0）
+	Tokens       int    // 同一份内容的 token 数
+	Upstream     string // 上游拒绝时的原文；网关预检拒绝时为空
+	ConfigKey    string // logical-context budget uses max_context_bytes
+	Unrestorable bool   // request shape cannot attach a native conversation
 }
 
 func (e *contextTooLargeError) Error() string {
+	if e.Unrestorable {
+		return fmt.Sprintf("此请求形态无法分段恢复（例如 assistant 预填充或无用户消息）：%d 字节超过单次发送预算 %d 字节（facade.max_prompt_bytes）；未创建项目或发送推理", e.Bytes, e.Limit)
+	}
 	if e.Upstream != "" {
 		return fmt.Sprintf("上下文超过上游单条消息上限（%d 字节 / %d tokens，上游拒绝：%s）。请压缩历史（Codex 执行 /compact）或开新会话",
 			e.Bytes, e.Tokens, e.Upstream)
@@ -94,12 +93,14 @@ func (r *Runner) checkPromptSize(req *RunRequest) error {
 		limit = r.cfg.Facade.ContextByteLimit()
 		key = "max_context_bytes"
 	}
-	if limit <= 0 {
-		return nil
-	}
 	items := r.upstreamPromptItems(req)
-	if n := promptBytes(items); n > limit {
+	if n := promptBytes(items); limit > 0 && n > limit {
 		return &contextTooLargeError{Bytes: n, Limit: limit, Tokens: countInputTokens(items), ConfigKey: key}
+	}
+	if req.PreserveContext && req.Native == nil {
+		if physical := r.cfg.Facade.PromptByteLimit(); physical > 0 && promptBytes(items) > physical {
+			return &contextTooLargeError{Bytes: promptBytes(items), Limit: physical, Tokens: countInputTokens(items), Unrestorable: true}
+		}
 	}
 	return nil
 }
@@ -115,6 +116,9 @@ func (r *Runner) checkUpstreamPromptSize(items []prism.InputItem) error {
 // responsesErrorCode 是 response.failed 里的 error.code。Codex 只有收到
 // context_length_exceeded 才会压缩或裁历史，其余代码一律当可重试的断线。
 func responsesErrorCode(err error) string {
+	if errors.Is(err, errContextRestore) {
+		return "context_restore_failed"
+	}
 	if errors.Is(err, ErrContextTooLarge) {
 		return "context_length_exceeded"
 	}

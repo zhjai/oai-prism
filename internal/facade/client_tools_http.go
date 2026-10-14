@@ -294,6 +294,9 @@ func (h *Handler) handleClientTools(w http.ResponseWriter, r *http.Request, b *c
 
 func (h *Handler) writeClientToolError(w http.ResponseWriter, r *http.Request, api string, err error) {
 	middleware.RecordLogError(r, "client tools failed: %v", err)
+	if writeContextRestoreFailed(w, err, api) {
+		return
+	}
 	if api == "messages" && writeAnthropicTooLarge(w, err) {
 		return
 	}
@@ -306,14 +309,6 @@ func (h *Handler) writeClientToolError(w http.ResponseWriter, r *http.Request, a
 			return
 		}
 		writeErrorCode(w, http.StatusBadGateway, "upstream_error", "tool_bridge_invalid_output", err.Error())
-		return
-	}
-	if errors.Is(err, errContextRestore) {
-		if api == "messages" {
-			writeJSON(w, http.StatusBadGateway, map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "code": "context_restore_failed", "message": "完整上下文恢复失败；未裁剪数据或继续生成，请重试完整请求"}})
-			return
-		}
-		writeErrorCode(w, http.StatusBadGateway, "upstream_error", "context_restore_failed", "完整上下文恢复失败；未裁剪数据或继续生成，请重试完整请求")
 		return
 	}
 	if errors.Is(err, context.Canceled) {

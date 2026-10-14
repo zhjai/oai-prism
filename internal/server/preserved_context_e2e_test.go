@@ -16,6 +16,32 @@ func preservedResponseBody(text string) map[string]any {
 	return body
 }
 
+func TestPreservedContextE2E_WrappedSizeErrorIsSanitized(t *testing.T) {
+	for _, api := range []string{"chat/completions", "responses", "messages"} {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%t", api, stream), func(t *testing.T) {
+				up := &fakeUpstream{t: t, preservedContext: true, restoreTooLarge: true}
+				ts, _ := newTestServer(t, up, goodAccount(), nil)
+				body := clientToolBody(api, stream)
+				text := strings.Repeat("record ", 16000)
+				if api == "responses" {
+					body["input"] = text
+				} else {
+					body["messages"] = []any{map[string]any{"role": "user", "content": text}}
+				}
+				code, out := postClientTool(t, ts.URL, api, body)
+				want := 502
+				if stream {
+					want = 200
+				}
+				if code != want || !strings.Contains(out, "context_restore_failed") || strings.Contains(out, "PRIVATE_SYNTHETIC_BODY") || strings.Contains(out, "context_length_exceeded") || startCount(up) != 1 {
+					t.Fatalf("unsanitized nested restore error: %d %.400s", code, out)
+				}
+			})
+		}
+	}
+}
+
 func assertPreservedFragments(t *testing.T, up *fakeUpstream, first, last int, original string) {
 	t.Helper()
 	var data strings.Builder

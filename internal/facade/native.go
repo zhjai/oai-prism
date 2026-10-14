@@ -452,7 +452,11 @@ func (r *Runner) planNative(ctx context.Context, p prism.Principal, acctID, proj
 			if !req.Bridge && r.cfg.Facade.PlatformNotice {
 				notice = platformNotice
 			}
-			items, sysHash, since := nt.deltaItems(b, rest, r.cfg.Facade.PromptByteLimit(), notice)
+			limit := r.cfg.Facade.PromptByteLimit()
+			if req.PreserveContext {
+				limit = 0 // restore the complete delta instead of pruning new entries
+			}
+			items, sysHash, since := nt.deltaItems(b, rest, limit, notice)
 			plan.cid, plan.continued, plan.sysHash, plan.sinceSys = b.cid, true, sysHash, since
 			r.log.Info("原生续接：发送增量", "key", nt.key, "cid", b.cid,
 				"newEntries", len(rest), "bytes", promptBytes(items), "fullSystem", textOfSystem(items) != nativeBriefSystem)
@@ -583,6 +587,7 @@ func (r *Runner) seedConversation(ctx context.Context, acct *account.Account, re
 			Input: seed, Model: req.Model, Effort: req.Effort, UserID: req.UserID,
 			ConversationID: plan.cid, ProjectID: projectID, StickyKey: req.StickyKey,
 			API: req.API, Bridge: true, ExtraHeaders: req.ExtraHeaders, Deadline: req.Deadline,
+			ContextRestore: req.PreserveContext,
 		}
 		res, err := r.runOnce(ctx, acct, sreq, nil)
 		if err != nil {

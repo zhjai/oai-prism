@@ -258,12 +258,12 @@ type FacadeConfig struct {
 	// UTF-8 字节上限。上游按字节而不是 token 限长：2026-10-04 实测合计 102,299 字节
 	// 可过、104,560 字节报 "This request is too large to send"（约 100 KiB），与内容
 	// 是中文还是英文无关。新建上游会话时按它决定历史随首轮一条发完还是分段补种（见
-	// internal/facade/native.go）；本轮内容本身就超限的请求不再发出，直接以
-	// context_length_exceeded 失败。
+	// internal/facade/native.go）。完整请求按 MaxContextBytes 接收，实际发送前按
+	// 本项规划原生增量或完整分段；系统指令/工具目录本身必须放得下。
 	// 默认 96 KiB，给上游自己的包装文本留余量；设为 -1 关闭检查。
 	MaxPromptBytes int `yaml:"max_prompt_bytes"`
 
-	// MaxContextBytes limits complete generic client-tool context before native
+	// MaxContextBytes limits complete client context before native
 	// continuation or lossless segmentation. It is independent of the physical
 	// per-send MaxPromptBytes cap. Zero uses the 1 MiB default; negative disables.
 	MaxContextBytes int `yaml:"max_context_bytes"`

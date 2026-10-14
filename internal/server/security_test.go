@@ -44,6 +44,7 @@ func doLocal(t *testing.T, method, url, body string, hdr map[string]string) (int
 func TestSecurity_LargeBodyNotTruncated(t *testing.T) {
 	ts, _ := newTestServer(t, &fakeUpstream{t: t}, goodAccount(), func(c *config.Config) {
 		c.Facade.MaxPromptBytes = -1
+		c.Facade.MaxContextBytes = -1
 	})
 	big := strings.Repeat("a", 2<<20)
 	body := `{"model":"gpt-5","messages":[{"role":"user","content":"` + big + `"}]}`

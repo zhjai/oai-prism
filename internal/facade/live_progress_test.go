@@ -60,14 +60,15 @@ func TestProgressDedupWindow(t *testing.T) {
 }
 
 type progressFixture struct {
-	runner    *Runner
-	handler   *Handler
-	request   *RunRequest
-	starts    atomic.Int32
-	polls     atomic.Int32
-	stops     atomic.Int32
-	pollError atomic.Int32
-	startBody string
+	runner         *Runner
+	handler        *Handler
+	request        *RunRequest
+	starts         atomic.Int32
+	polls          atomic.Int32
+	stops          atomic.Int32
+	pollError      atomic.Int32
+	pollErrorLimit atomic.Int32
+	startBody      string
 }
 
 func newProgressFixture(t *testing.T, statuses []string, interval time.Duration) *progressFixture {
@@ -81,7 +82,7 @@ func newProgressFixture(t *testing.T, statuses []string, interval time.Duration)
 			io.WriteString(w, f.startBody)
 		case prism.PathResponseStatus:
 			i := int(f.polls.Add(1)) - 1
-			if code := int(f.pollError.Load()); code != 0 {
+			if code := int(f.pollError.Load()); code != 0 && (f.pollErrorLimit.Load() == 0 || i < int(f.pollErrorLimit.Load())) {
 				http.Error(w, "synthetic upstream failure", code)
 				return
 			}
@@ -119,6 +120,27 @@ func newProgressFixture(t *testing.T, statuses []string, interval time.Duration)
 	f.handler = NewHandler(cfg, log, f.runner, app)
 	f.request = &RunRequest{Input: []prism.InputItem{prism.NewUserItem("answer")}, Model: "test", API: "responses", ProjectID: "project"}
 	return f
+}
+
+func TestRestorePollTransientFailureKeepsSameInference(t *testing.T) {
+	f := newProgressFixture(t, []string{progressFinal}, time.Millisecond)
+	f.pollError.Store(502)
+	f.pollErrorLimit.Store(1)
+	f.request.ContextRestore = true
+	res, err := f.runner.Run(context.Background(), f.request, nil)
+	if err != nil || res == nil || res.Text != "21" || f.starts.Load() != 1 || f.polls.Load() != 2 {
+		t.Fatalf("restore poll started a second inference: starts=%d polls=%d err=%v", f.starts.Load(), f.polls.Load(), err)
+	}
+}
+
+func TestRestoreStartSandboxFailureDoesNotRestart(t *testing.T) {
+	f := newProgressFixture(t, []string{progressFinal}, time.Millisecond)
+	f.startBody = `{"status":"completed","request_id":"req","response":{"status":"error","payload":{"message":"Gateway timeout. Please submit prompt again."}}}`
+	f.request.ContextRestore = true
+	_, err := f.runner.Run(context.Background(), f.request, nil)
+	if err == nil || f.starts.Load() != 1 || f.stops.Load() != 1 {
+		t.Fatalf("ambiguous restore start replayed: starts=%d stops=%d err=%v", f.starts.Load(), f.stops.Load(), err)
+	}
 }
 
 const progressPending = `{"request_id":"req","status":"pending","turn_state":{"seq":1},"codex_live_progress":{"eventPreviews":[{"line_index":1,"payload_type":"agent_reasoning","raw":{"payload":{"text":"thinking"}}},{"line_index":2,"payload_type":"agent_message","raw":{"payload":{"message":"working"}}}]}}`

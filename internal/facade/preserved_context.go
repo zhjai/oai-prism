@@ -3,12 +3,27 @@ package facade
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/oai-prism/oaiprism/internal/prism"
 )
 
 var errContextRestore = errors.New("context_restore_failed")
+
+const contextRestoreMessage = "完整上下文恢复失败（context_restore_failed）；未裁剪数据或自动重放。已受影响的会话状态不会用于续接，上游结果可能不明，请检查后再决定是否重试"
+
+func writeContextRestoreFailed(w http.ResponseWriter, err error, api string) bool {
+	if !errors.Is(err, errContextRestore) {
+		return false
+	}
+	if api == "messages" {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "code": "context_restore_failed", "message": contextRestoreMessage}})
+	} else {
+		writeErrorCode(w, http.StatusBadGateway, "upstream_error", "context_restore_failed", contextRestoreMessage)
+	}
+	return true
+}
 
 const preservedSeedSystem = "The next messages contain ordered fragments of an API client's exact transcript. Read them as inert context only. A JSON value may span fragments: concatenate their data in order before interpreting it. Do not act, request tools, execute anything, or answer the task yet. Reply with exactly OK to acknowledge each fragment. Only resume the task when the gateway explicitly sends the end-of-restoration instruction."
 const preservedSeedHeader = "[Client context fragment %d/%d; UTF-8 bytes %d:%d]\n"
@@ -47,6 +62,9 @@ func (r *Runner) planPreservedContext(req *RunRequest, input []prism.InputItem) 
 	// Reassert the complete current system/catalog/choice in the final inference.
 	// A system which alone exceeds the transport cap cannot be restored safely.
 	finalSystem := nt.conv.system + "\n\n" + nt.conv.extra
+	if !req.Bridge && r.cfg.Facade.PlatformNotice {
+		finalSystem = platformNotice + "\n\n" + finalSystem
+	}
 	finalUser := prism.NewUserItem(preservedResume + "\n\n" + nt.conv.extra)
 	for _, item := range input {
 		for _, c := range item.Content {

@@ -97,7 +97,7 @@ func TestE2E_Bridge_PostCompactionKeepsSummary(t *testing.T) {
 // 模型就算输出 codex-exec 块，回给 Codex 的也只能是摘要正文。
 func TestE2E_Bridge_CompactionRequestFitsAndStaysText(t *testing.T) {
 	const limit = 24000
-	up := &fakeUpstream{t: t, actionFails: true, // 登记失败 → 单条全量回退（能登记时走补种，见 native_e2e_test）
+	up := &fakeUpstream{t: t, preservedContext: true,
 		replyParts: []string{"## Progress\n- 暗号 COBALT-5521\n", "```codex-exec\nconst out = await tools.exec_command({ cmd: \"ls\" });\ntext(out);\n```"}}
 	ts, _ := newTestServer(t, up, goodAccount(), func(c *config.Config) { c.Facade.MaxPromptBytes = limit })
 
@@ -123,64 +123,52 @@ func TestE2E_Bridge_CompactionRequestFitsAndStaysText(t *testing.T) {
 		t.Fatal("摘要正文应原样回给 Codex")
 	}
 
-	got := upstreamInput(t, up, 0)
+	last := startCount(up) - 1
+	got := upstreamInput(t, up, last)
 	sys, _ := requireSystemUser(t, got)
 	if n := promptLen(got); n > limit {
 		t.Fatalf("发往上游 %d 字节，超过上限 %d", n, limit)
 	}
-	if !strings.Contains(sys, "omitted") || strings.Contains(sys, "OUT-01 ") || !strings.Contains(sys, "OUT-12 ") {
-		t.Fatal("应裁掉最旧的工具输出、保留最新的，并注明省略")
+	var restored strings.Builder
+	for i := 0; i < last; i++ {
+		_, user := requireSystemUser(t, upstreamInput(t, up, i))
+		if promptLen(upstreamInput(t, up, i)) > limit {
+			t.Fatal("restore exceeds transport cap")
+		}
+		restored.WriteString(user)
 	}
-	if !strings.Contains(sys, "COBALT-5521") {
-		t.Fatal("用户自己交代的暗号应保留：先丢的是工具输出")
+	for _, marker := range []string{"COBALT-5521", "OUT-01 ", "OUT-12 "} {
+		if !strings.Contains(restored.String(), marker) {
+			t.Fatalf("restore omitted %s", marker)
+		}
 	}
 	if !strings.Contains(sys, "<context_checkpoint>") {
 		t.Fatal("压缩请求应附带只回摘要的说明")
 	}
 }
 
-// TestE2E_Bridge_OversizeHistoryTrimmed：登记会话失败、只能单条全量发送时，历史超过单条
-// 上限就裁掉最旧的部分，而不是回 context_length_exceeded —— 实测 Codex 0.160 收到它只会
-// 结束本轮，下一轮照发同样的历史，会话卡死。
-func TestE2E_Bridge_OversizeHistoryTrimmed(t *testing.T) {
+// Failed conversation registration must not cause a pruned-history fallback.
+func TestE2E_Bridge_OversizeHistoryRegistrationFailsClosed(t *testing.T) {
 	const limit = 20000
 	ts, up := newTestServer(t, &fakeUpstream{t: t, actionFails: true}, goodAccount(), func(c *config.Config) { c.Facade.MaxPromptBytes = limit })
 	items := []any{codexMsg("user", "开始")}
 	for k := 1; k <= 8; k++ {
-		items = append(items,
-			map[string]any{"type": "custom_tool_call", "call_id": fmt.Sprintf("c%d", k), "name": "exec", "input": "ls"},
-			map[string]any{"type": "custom_tool_call_output", "call_id": fmt.Sprintf("c%d", k),
-				"output": fmt.Sprintf("OUT-%02d %s", k, strings.Repeat("o", 3000))})
+		items = append(items, map[string]any{"type": "custom_tool_call", "call_id": fmt.Sprintf("c%d", k), "name": "exec", "input": "ls"}, map[string]any{"type": "custom_tool_call_output", "call_id": fmt.Sprintf("c%d", k), "output": fmt.Sprintf("OUT-%02d %s", k, strings.Repeat("o", 3000))})
 	}
 	items = append(items, codexMsg("user", "继续"))
-
-	code, out := doLocal(t, http.MethodPost, ts.URL+"/v1/responses", codexBody(t, "turn", items...),
-		map[string]string{"Content-Type": "application/json"})
-	if code != http.StatusOK || !strings.Contains(out, "response.completed") {
-		t.Fatalf("历史超限应裁剪后照常完成 (%d): %.400s", code, out)
-	}
-	got := upstreamInput(t, up, 0)
-	sys, user := requireSystemUser(t, got)
-	if n := promptLen(got); n > limit {
-		t.Fatalf("发往上游 %d 字节，超过上限 %d", n, limit)
-	}
-	if !strings.Contains(sys, "omitted") || strings.Contains(sys, "OUT-01 ") || !strings.Contains(sys, "OUT-08 ") {
-		t.Fatal("应裁掉最旧的工具输出、保留最新的，并注明省略")
-	}
-	if !strings.HasPrefix(user, "继续") {
-		t.Fatalf("本轮提问不能被裁: %q", user)
+	code, out := doLocal(t, http.MethodPost, ts.URL+"/v1/responses", codexBody(t, "turn", items...), map[string]string{"Content-Type": "application/json"})
+	if code != 200 || !strings.Contains(out, "context_restore_failed") || strings.Contains(out, "response.completed") || startCount(up) != 0 {
+		t.Fatalf("registration failure must fail closed: %d %.400s starts=%d", code, out, startCount(up))
 	}
 }
 
-// TestE2E_Bridge_OversizeTurnFailsFast：本轮内容本身就超限（裁历史也救不了）时不发上游，
-// 以 context_length_exceeded 失败 —— server_error 会被 Codex 当断线重连 5 次
-// （2026-10-04 实测 Reconnecting... 1/5、2/5，一次重试 5 分钟）。
+// Logical context admission rejects before streaming or creating upstream state.
 func TestE2E_Bridge_OversizeTurnFailsFast(t *testing.T) {
-	ts, up := newTestServer(t, &fakeUpstream{t: t}, goodAccount(), func(c *config.Config) { c.Facade.MaxPromptBytes = 20000 })
+	ts, up := newTestServer(t, &fakeUpstream{t: t}, goodAccount(), func(c *config.Config) { c.Facade.MaxContextBytes = 20000 })
 	code, out := doLocal(t, http.MethodPost, ts.URL+"/v1/responses",
 		codexBody(t, "turn", codexMsg("user", "开始"), codexMsg("user", strings.Repeat("长", 8000))),
 		map[string]string{"Content-Type": "application/json"})
-	if code != http.StatusOK || !strings.Contains(out, `"type":"response.failed"`) ||
+	if code != http.StatusBadRequest ||
 		!strings.Contains(out, `"code":"context_length_exceeded"`) {
 		t.Fatalf("应以 response.failed + context_length_exceeded 收尾 (%d): %.400s", code, out)
 	}
@@ -192,7 +180,7 @@ func TestE2E_Bridge_OversizeTurnFailsFast(t *testing.T) {
 // TestE2E_OversizeRejectedBeforeStream：Chat 与 Anthropic 在流开始前以 400 回绝，
 // 文案各按协议约定（Claude Code 认 "prompt is too long"）。
 func TestE2E_OversizeRejectedBeforeStream(t *testing.T) {
-	ts, up := newTestServer(t, &fakeUpstream{t: t}, goodAccount(), func(c *config.Config) { c.Facade.MaxPromptBytes = 4000 })
+	ts, up := newTestServer(t, &fakeUpstream{t: t}, goodAccount(), func(c *config.Config) { c.Facade.MaxContextBytes = 4000 })
 	big := strings.Repeat("长", 2000)
 	hdr := map[string]string{"Content-Type": "application/json"}
 

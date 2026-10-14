@@ -87,9 +87,12 @@ type RunRequest struct {
 	// A rejected reply must never become a successful continuation prefix.
 	PostProcess func(*RunResult) error
 
-	// PreserveContext forbids pruning generic client-tool transcripts. Admission
+	// PreserveContext forbids pruning complete client transcripts. Admission
 	// measures full context; native planning enforces the separate per-send cap.
 	PreserveContext bool
+	// ContextRestore marks internal fragment requests, which must never start
+	// another inference after an ambiguous start failure.
+	ContextRestore bool
 
 	// BoundAccountID 是 ProjectID / ConversationID 所属的账号（来自会话链或原生续接的绑定）。
 	// 项目与会话是账号私有资源：实际租到的账号与它不同（粘性过期、原账号冷却、换号重试）时，
@@ -367,6 +370,11 @@ func (r *Runner) Run(ctx context.Context, req *RunRequest, emit func(Delta) erro
 		}
 
 		res, err := r.runOnce(ctx, lease.Account, req, emit)
+		if err != nil && req.PreserveContext && req.Native != nil && req.Native.plan != nil && len(req.Native.plan.seeds) > 0 {
+			// Includes final inference failures after acknowledged fragments.
+			// Replaying now would duplicate an outcome that may be unknown.
+			err = fmt.Errorf("%w: %w", errContextRestore, err)
+		}
 		if err == nil && req.PostProcess != nil {
 			err = req.PostProcess(res)
 		}
@@ -383,7 +391,7 @@ func (r *Runner) Run(ctx context.Context, req *RunRequest, emit func(Delta) erro
 				// failure leaves extra upstream state. Never reuse that prefix.
 				seeded := req.PreserveContext && nt.plan != nil && len(nt.plan.seeds) > 0
 				nt.release(gone || seeded || errors.Is(err, errClientToolOutput) || errors.Is(err, errContextRestore), r)
-				if gone && !emitted && (res == nil || res.Text == "") && ctx.Err() == nil && attempt+1 < r.accountRetries {
+				if gone && !seeded && !errors.Is(err, errContextRestore) && !emitted && (res == nil || res.Text == "") && ctx.Err() == nil && attempt+1 < r.accountRetries {
 					r.log.Warn("原生续接：上游会话不可用，改用新会话全量重试", "key", nt.key, "err", err)
 					lastErr, lastRes = err, res
 					continue
@@ -403,6 +411,11 @@ func (r *Runner) Run(ctx context.Context, req *RunRequest, emit func(Delta) erro
 
 		lastErr = err
 		if errors.Is(err, errContextRestore) {
+			// A failed restore must not replay or switch accounts. Credential and
+			// rate-limit failures still update health and trigger the refresh loop.
+			if creds.IsAuthError(err) || creds.IsRateLimited(err) {
+				r.pool.MarkResult(lease.Account, err, retryAfter(err))
+			}
 			r.app.FacadeRuns.Inc(api, req.Model, "context_restore_failed")
 			return res, err
 		}
@@ -485,7 +498,7 @@ func (r *Runner) acquire(ctx context.Context, req *RunRequest) (*account.Lease, 
 }
 
 // runOnce 在指定账号上跑一次完整流程。
-func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunRequest, emit func(Delta) error) (*RunResult, error) {
+func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunRequest, emit func(Delta) error) (_ *RunResult, returnedErr error) {
 	started := time.Now()
 
 	cred := acct.Credential()
@@ -600,7 +613,11 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 	}
 	// 用量按真正发往上游的条目计（图片预处理之后），与上游生成并行计数
 	inputTokens := countInputAsync(inputItems)
-	if req.Native != nil && req.Native.plan.continued {
+	if req.PreserveContext {
+		// Cold restore final messages are small; usage must describe the full
+		// admitted context, not just the end-of-restoration instruction.
+		inputTokens = countInputAsync(r.upstreamPromptItems(req))
+	} else if req.Native != nil && req.Native.plan.continued {
 		// 增量只是上游会话的一小段：模型每轮读的是整段会话，用量按完整上下文计
 		// （Codex 也据此判断窗口占用、决定何时压缩）。
 		inputTokens = countInputAsync(req.Native.conv.logicalItems())
@@ -661,7 +678,12 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 	// 沙箱冷启动时上游会回 504 文案并提示 "Please submit prompt again"，
 	// 这是上游自己建议的处理方式 —— 照做即可，不要当成协议错误。
 	r.log.Info("发给上游的请求参数", "convID", convIDOut, "itemsCount", len(inputItems))
-	for attempt := 1; attempt <= sandboxStartRetries; attempt++ {
+	restoring := req.ContextRestore || (req.PreserveContext && req.Native != nil && req.Native.plan != nil && len(req.Native.plan.seeds) > 0)
+	startAttempts := sandboxStartRetries
+	if restoring {
+		startAttempts = 1
+	}
+	for attempt := 1; attempt <= startAttempts; attempt++ {
 		startResp, err = r.client.StartResponse(ctx, p, &prism.StartRequest{
 			Input:           inputItems,
 			ConversationID:  convIDOut,
@@ -672,7 +694,7 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 			Extra:           req.Extra,
 		})
 		if err != nil {
-			if isSentinelThrottle(err) && attempt < sandboxStartRetries {
+			if isSentinelThrottle(err) && attempt < startAttempts {
 				r.log.Info("start 遭遇 Sentinel 风控抖动，稍后重试", "attempt", attempt, "err", err)
 				if serr := sleepCtx(ctx, 1500*time.Millisecond); serr != nil {
 					return result, serr
@@ -709,7 +731,7 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 				r.sandboxes.InvalidateProject(acct.ID, projectID)
 			}
 		}
-		if attempt == sandboxStartRetries {
+		if attempt == startAttempts {
 			break // 最后一次仍未就绪：直接报错，不再白等一轮退避和重新装配沙箱
 		}
 		// 线性退避：上游限流窗口是分钟级，固定短间隔只会打在限流上。
@@ -796,6 +818,11 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 
 	result.RequestID = requestID
 	result.ConversationID = convID
+	defer func() {
+		if restoring && returnedErr != nil && requestID != "" && !errors.Is(returnedErr, context.Canceled) && !errors.Is(returnedErr, context.DeadlineExceeded) && !errors.Is(returnedErr, ErrPollTimeout) {
+			r.stopUpstream(p, requestID, convID, turnState)
+		}
+	}()
 	if len(startResp.ListenSnapshot) > 0 {
 		result.ListenSnapshot = startResp.ListenSnapshot
 	}
@@ -939,7 +966,9 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 				}
 				continue
 			}
-			if isAccountLevel(err) {
+			var ae *creds.APIError
+			transientRestorePoll := restoring && errors.As(err, &ae) && ae.Status >= 500 && ae.Status <= 599
+			if isAccountLevel(err) && !transientRestorePoll {
 				return result, err
 			}
 			failures++

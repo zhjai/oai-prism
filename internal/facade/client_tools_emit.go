@@ -188,19 +188,23 @@ func (h *Handler) streamClientTools(w http.ResponseWriter, r *http.Request, runR
 			return
 		}
 		code := clientToolStreamCode(runErr)
+		message := runErr.Error()
+		if errors.Is(runErr, errContextRestore) {
+			message = contextRestoreMessage
+		}
 		middleware.RecordLogError(r, "client tools stream failed: %s", code)
 		switch api {
 		case "chat":
-			data, _ := json.Marshal(map[string]any{"error": map[string]any{"type": "upstream_error", "code": code, "message": runErr.Error()}})
+			data, _ := json.Marshal(map[string]any{"error": map[string]any{"type": "upstream_error", "code": code, "message": message}})
 			_ = sw.WriteData(data)
 			_ = sw.Done()
 		case "responses":
 			resp := response("failed")
-			resp["error"] = map[string]any{"code": code, "message": runErr.Error()}
+			resp["error"] = map[string]any{"code": code, "message": message}
 			_ = s.event("response.failed", map[string]any{"response": resp})
 		case "messages":
-			typ, message := "api_error", runErr.Error()
-			if errors.Is(runErr, ErrContextTooLarge) {
+			typ := "api_error"
+			if !errors.Is(runErr, errContextRestore) && errors.Is(runErr, ErrContextTooLarge) {
 				typ, message = "invalid_request_error", anthropicTooLongMessage(runErr)
 			}
 			_ = s.event("error", map[string]any{"error": map[string]any{"type": typ, "code": code, "message": message}})

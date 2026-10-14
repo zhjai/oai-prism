@@ -90,6 +90,9 @@ type fakeUpstream struct {
 	// reject an acknowledgment to verify transactional failure without fallback.
 	preservedContext bool
 	restoreBadAck    bool
+	restoreHTTP      int  // reject a context fragment before inference
+	finalRestoreHTTP int  // reject final inference after fragments were acknowledged
+	restoreTooLarge  bool // nested size error must remain a sanitized restore failure
 
 	// 会话登记（Server Action createProjectConversation）：convs 是登记过的会话 ID，
 	// actionFails 让登记失败，goneConvs 里的会话在 start 时回 conversation_too_large。
@@ -282,6 +285,33 @@ func (f *fakeUpstream) handler() http.Handler {
 		f.startBodies = append(f.startBodies, body)
 		f.startAuths = append(f.startAuths, r.Header.Get("Authorization"))
 		f.mu.Unlock()
+		if f.restoreHTTP != 0 || f.finalRestoreHTTP != 0 || f.restoreTooLarge {
+			items, _ := body["input"].([]any)
+			for _, item := range items {
+				message, _ := item.(map[string]any)
+				blocks, _ := message["content"].([]any)
+				for _, block := range blocks {
+					b, _ := block.(map[string]any)
+					text, _ := b["text"].(string)
+					code := 0
+					if strings.HasPrefix(text, "[Client context fragment ") {
+						if f.restoreTooLarge {
+							w.Header().Set("Content-Type", "application/json")
+							_, _ = w.Write([]byte(`{"status":"completed","request_id":"req-size","response":{"status":"error","payload":{"message":"This request is too large to send PRIVATE_SYNTHETIC_BODY"}}}`))
+							return
+						}
+						code = f.restoreHTTP
+					}
+					if strings.HasPrefix(text, "[End of client context restoration]") {
+						code = f.finalRestoreHTTP
+					}
+					if code != 0 {
+						http.Error(w, "synthetic restore rejection", code)
+						return
+					}
+				}
+			}
+		}
 
 		// 复刻上游最直白的校验：input 必须是数组。
 		if _, ok := body["input"].([]any); !ok {

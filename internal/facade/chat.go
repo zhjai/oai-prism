@@ -58,16 +58,17 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	}
 
 	runReq := &RunRequest{
-		Model:        model,
-		Effort:       effort,
-		UserID:       req.User,
-		Input:        translateChatMessages(req.Messages, h.cfg.Facade.DefaultSystemPrompt, h.cfg.Facade.PromptByteLimit()),
-		Metadata:     mergeMetadata(clientMetadata(rawFields), metadataWith("tools", toolsMetadata(req.Tools))),
-		StickyKey:    conversationKey(r, rawFields, req.Messages),
-		AccountID:    accountID,
-		ProjectID:    projectID,
-		API:          "chat",
-		ExtraHeaders: extractSentinelToken(r),
+		Model:           model,
+		Effort:          effort,
+		UserID:          req.User,
+		Input:           translateChatMessages(req.Messages, h.cfg.Facade.DefaultSystemPrompt, 0),
+		Metadata:        mergeMetadata(clientMetadata(rawFields), metadataWith("tools", toolsMetadata(req.Tools))),
+		StickyKey:       conversationKey(r, rawFields, req.Messages),
+		AccountID:       accountID,
+		ProjectID:       projectID,
+		API:             "chat",
+		ExtraHeaders:    extractSentinelToken(r),
+		PreserveContext: true,
 	}
 	runReq.Extra = passthroughFields(rawFields, chatKnownFields)
 	// 原生续接：会话历史由上游保管，续接轮次只发增量（见 native.go）。
@@ -78,7 +79,7 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// 超过上游单条上限：流开始之前就以 400 context_length_exceeded 回绝（见 context_limit.go）。
+	// Admit complete context before streaming; the runner bounds each physical send.
 	if err := h.runner.checkPromptSize(runReq); writeContextTooLarge(w, err) {
 		middleware.RecordLogError(r, "chat 提示词超限: %v", err)
 		return
@@ -172,6 +173,8 @@ func (h *Handler) streamChat(w http.ResponseWriter, r *http.Request, runReq *Run
 	if err := sw.WriteData(buf); err != nil {
 		return
 	}
+	stopHeartbeat := streamHeartbeat(r.Context(), sw)
+	defer stopHeartbeat()
 
 	emit := func(d Delta) error {
 		for _, progress := range d.Progress {
@@ -208,6 +211,7 @@ func (h *Handler) streamChat(w http.ResponseWriter, r *http.Request, runReq *Run
 	}
 
 	res, runErr := h.runner.Run(r.Context(), runReq, emit)
+	stopHeartbeat()
 	bindLogResult(r, res)
 
 	if runErr != nil {
@@ -219,8 +223,11 @@ func (h *Handler) streamChat(w http.ResponseWriter, r *http.Request, runReq *Run
 			// HTTP 200 已发出，把失败原因记进请求日志（异常错误摘要）。
 			middleware.RecordLogError(r, "chat 流式失败: %v", runErr)
 			buf = append(buf[:0], `{"error":{"message":`...)
-			buf = sse.AppendJSONString(buf, runErr.Error())
-			if errors.Is(runErr, ErrContextTooLarge) {
+			_, _, msg := mapError(runErr)
+			buf = sse.AppendJSONString(buf, msg)
+			if errors.Is(runErr, errContextRestore) {
+				buf = append(buf, `,"type":"upstream_error","code":"context_restore_failed"}}`...)
+			} else if errors.Is(runErr, ErrContextTooLarge) {
 				buf = append(buf, `,"type":"invalid_request_error","code":"context_length_exceeded"}}`...)
 			} else {
 				buf = append(buf, `,"type":"upstream_error"}}`...)
@@ -284,6 +291,9 @@ func (h *Handler) syncChat(w http.ResponseWriter, r *http.Request, runReq *RunRe
 	res, err := h.runner.Run(r.Context(), runReq, nil)
 	bindLogResult(r, res)
 	if err != nil {
+		if writeContextRestoreFailed(w, err, "chat") {
+			return
+		}
 		if writeContextTooLarge(w, err) {
 			middleware.RecordLogError(r, "chat 同步失败: %v", err)
 			return
@@ -381,6 +391,8 @@ func finishReason(toolCalls []ToolCall) string {
 // 对调用方而言这是"网关的上游凭据挂了"，属于 502。
 func mapError(err error) (int, string, string) {
 	switch {
+	case errors.Is(err, errContextRestore):
+		return http.StatusBadGateway, "upstream_error", contextRestoreMessage
 	case errors.Is(err, context.Canceled):
 		// 499 是 Nginx 约定的"客户端主动断开"。
 		return 499, "client_closed_request", "客户端提前断开了连接"

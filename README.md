@@ -183,7 +183,8 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 ```toml
 model_provider = "oaiprism"
 model = "gpt-5.6-sol"
-model_context_window = 1000000
+model_context_window = 160000
+model_auto_compact_token_limit = 120000
 
 [model_providers.oaiprism]
 name = "oaiprism"
@@ -270,7 +271,9 @@ Chat Completions 使用扩展字段 `progress_content`，Responses 使用 `phase
 
 Responses 用 `function_call_output` / `custom_tool_call_output` 回传结果，可配合 `previous_response_id` 续接；句柄缓存按 API Key 隔离，每条回复从创建时起有效 30 分钟，重启或淘汰后需重新发送完整历史。完整示例、支持范围和错误处理见 [客户端工具调用](docs/客户端工具调用.md)。
 
-通用工具完整上下文预算为 `facade.max_context_bytes: 1048576`（1 MiB，含工具指令）。`max_prompt_bytes: 98304` 继续约束每次上游发送；完整历史优先原生续接，单次放不下时完整分段恢复，不省略历史或截断结果。分段增加耗时，恢复失败返回 `context_restore_failed`。这不等于 Prism 支持 1 MiB 单次消息，也不保证模型逐字记忆所有内容。
+所有 Chat Completions、Responses（含 Codex 桥）和 Anthropic 请求的完整上下文预算为 `facade.max_context_bytes: 1048576`（1 MiB，含网关指令和工具目录），不要求声明工具。`max_prompt_bytes: 98304` 只约束每次上游发送；完整历史优先原生续接，单次放不下时由网关完整分段恢复，不省略历史或截断结果。客户端照常发送完整 API 请求即可。分段增加耗时，恢复失败返回 `context_restore_failed`；恢复中的未知结果不会自动重放或换号。这不等于 Prism 支持 1 MiB 单次消息，也不保证模型逐字记忆所有内容。系统指令及工具目录本身仍须放进单次上游预算。
+
+大上下文恢复需要可登记且未被其他请求占用的原生会话。末尾 assistant 预填充或无用户消息等不能建立原生会话的形态，超过单次预算时会在流开始及创建项目之前明确拒绝；登记失败或恢复中断会报错。附件目前在恢复后的最终轮处理。同步客户端及反向代理需为冷恢复设置足够的总超时，流式接口会发送保活心跳。
 
 <p align="center">
   <img src="docs/assets/screenshot-accounts.png" alt="账号与计划池" width="48%">

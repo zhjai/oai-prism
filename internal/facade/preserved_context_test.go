@@ -29,7 +29,7 @@ func TestPreservedTranscriptEveryByteIncludingUTF8AndJSON(t *testing.T) {
 func TestPreservedContextAdmissionAndTransportAreSeparate(t *testing.T) {
 	r := &Runner{cfg: &config.Config{Facade: config.FacadeConfig{MaxPromptBytes: 98304}}}
 	items := []prism.InputItem{prism.NewUserItem(strings.Repeat("data ", 25000))}
-	req := &RunRequest{Input: items, Bridge: true, PreserveContext: true}
+	req := &RunRequest{Input: items, Bridge: true, PreserveContext: true, Native: &nativeTurn{conv: nativeConv("", itemText(items[0]))}}
 	if err := r.checkPromptSize(req); err != nil {
 		t.Fatal("125KB complete context prematurely rejected", err)
 	}

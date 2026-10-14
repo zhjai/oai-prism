@@ -170,7 +170,7 @@ func TestE2E_Native_PreviousResponseIDContinues(t *testing.T) {
 // 再发本轮 —— 上游拿到全部历史，而不是裁剪后的尾巴。
 func TestE2E_Native_SeedsLongHistoryIntoNewConversation(t *testing.T) {
 	const limit = 24000
-	up := &fakeUpstream{t: t}
+	up := &fakeUpstream{t: t, preservedContext: true}
 	ts, _ := newTestServer(t, up, goodAccount(), func(c *config.Config) { c.Facade.MaxPromptBytes = limit })
 	items := []any{codexMsg("user", "记住本任务的暗号：COBALT-5521")}
 	for k := 1; k <= 12; k++ {
@@ -192,7 +192,7 @@ func TestE2E_Native_SeedsLongHistoryIntoNewConversation(t *testing.T) {
 	var seeded strings.Builder
 	for i := 0; i < n-1; i++ {
 		_, user := requireSystemUser(t, upstreamInput(t, up, i))
-		if startConv(t, up, i) != cid || !strings.HasPrefix(user, fmt.Sprintf("[Earlier conversation, part %d of %d", i+1, n-1)) {
+		if startConv(t, up, i) != cid || !strings.HasPrefix(user, fmt.Sprintf("[Client context fragment %d/%d", i+1, n-1)) {
 			t.Fatalf("第 %d 次 start 应是同一会话的补种段: %.80q", i+1, user)
 		}
 		if len(user) > limit {
@@ -206,7 +206,7 @@ func TestE2E_Native_SeedsLongHistoryIntoNewConversation(t *testing.T) {
 		}
 	}
 	sys, user := requireSystemUser(t, upstreamInput(t, up, n-1))
-	if startConv(t, up, n-1) != cid || !strings.HasPrefix(user, "暗号是什么？") || strings.Contains(sys, "OUT-0") {
+	if startConv(t, up, n-1) != cid || !strings.HasPrefix(user, "[End of client context restoration]") || strings.Contains(sys, "OUT-0") || !strings.Contains(seeded.String(), "暗号是什么？") {
 		t.Fatalf("最后一轮应在同一会话里只发本轮: sys=%.120q user=%.80q", sys, user)
 	}
 }

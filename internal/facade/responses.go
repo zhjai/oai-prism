@@ -167,7 +167,6 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	promptLimit := h.cfg.Facade.PromptByteLimit()
 	var input []prism.InputItem
 	// native 是原生续接用的拆分形态（system / 往轮对话 / 本轮消息，见 native.go）。
 	var native *nativeConversation
@@ -188,12 +187,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		if req.Instructions != "" {
 			fallback = ""
 		}
-		// instructions 稍后才前置，历史预算先把它扣掉。
-		histLimit := promptLimit
-		if promptLimit > 0 {
-			histLimit = max(1, promptLimit-len(req.Instructions))
-		}
-		input = messagesFromResponsesInput(req.Input, fallback, histLimit)
+		input = messagesFromResponsesInput(req.Input, fallback, 0)
 		input = prependSystemText(input, req.Instructions)
 		if native = chatConversation(responsesChatMessages(req.Input), fallback); native != nil {
 			if in := strings.TrimSpace(req.Instructions); in != "" {
@@ -210,17 +204,18 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	turn.isAux = isCodexAuxRequest(r, rawFields, bridge, hasTools)
 
 	runReq := &RunRequest{
-		Model:        model,
-		Effort:       effort,
-		UserID:       req.User,
-		Metadata:     mergeMetadata(clientMetadata(rawFields), metadataWith("tools", toolsMetadata(req.Tools))),
-		StickyKey:    stickyKey,
-		AccountID:    accountID,
-		ProjectID:    projectID,
-		API:          "responses",
-		ExtraHeaders: extractSentinelToken(r),
-		IsAux:        turn.isAux,
-		Bridge:       bridge,
+		Model:           model,
+		Effort:          effort,
+		UserID:          req.User,
+		Metadata:        mergeMetadata(clientMetadata(rawFields), metadataWith("tools", toolsMetadata(req.Tools))),
+		StickyKey:       stickyKey,
+		AccountID:       accountID,
+		ProjectID:       projectID,
+		API:             "responses",
+		ExtraHeaders:    extractSentinelToken(r),
+		IsAux:           turn.isAux,
+		Bridge:          bridge,
+		PreserveContext: true,
 	}
 	runReq.Extra = passthroughFields(rawFields, responsesKnownFields)
 
@@ -267,9 +262,8 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	// （见 native.go）。客户端的 previous_response_id / conversation_id 只用来找回会话，
 	// 不透传给上游 —— 上游只续接经 Server Action 登记的会话，由 runner 自行登记。
 	if bridge {
-		// Codex 每轮都带完整上下文：折叠成 [system, user]，超过单条上限时裁掉最旧的历史
-		// （放不下时原生续接改为分段补种，裁剪版只作回退）。
-		runReq.Input = foldInputHistory(input, promptLimit)
+		// Keep the full bridge history for logical admission and native restore.
+		runReq.Input = foldInputHistory(input, 0)
 	} else {
 		// 非桥：translateChatMessages 已把客户端历史折进 system。
 		runReq.Input = input
@@ -297,6 +291,9 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 // dispatchResponses 按 stream 字段分派。
 func (h *Handler) dispatchResponses(w http.ResponseWriter, r *http.Request, runReq *RunRequest, turn *responsesTurn) {
 	if !verifyCatalogContinuity(w, r, runReq) {
+		return
+	}
+	if err := h.runner.checkPromptSize(runReq); writeContextTooLarge(w, err) {
 		return
 	}
 	if turn.stream {
@@ -504,8 +501,9 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, runReq
 		h.log.Error("responses 流式失败", "err", runErr, "chainKey", turn.chainKey)
 		middleware.RecordLogError(r, "responses 流式失败: %v", runErr)
 		// error.code 决定 Codex 怎么处理：context_length_exceeded 触发压缩，其余当断线重连。
+		_, _, msg := mapError(runErr)
 		buf = AppendResponsesEvent(buf[:0], ResponsesEvent{Type: "response.failed", ResponseID: id, Model: publicModel,
-			CreatedAt: created, Text: runErr.Error(), Status: responsesErrorCode(runErr)})
+			CreatedAt: created, Text: msg, Status: responsesErrorCode(runErr)})
 		_ = sw.WriteRaw(buf)
 	}
 
@@ -701,6 +699,9 @@ func (h *Handler) syncResponses(w http.ResponseWriter, r *http.Request, runReq *
 	res, err := h.runResponses(r, runReq, nil)
 	if err != nil {
 		h.log.Error("responses 同步失败", "err", err, "chainKey", turn.chainKey)
+		if writeContextRestoreFailed(w, err, "responses") {
+			return
+		}
 		if writeContextTooLarge(w, err) {
 			middleware.RecordLogError(r, "responses 同步失败: %v", err)
 			return
