@@ -318,7 +318,7 @@ func TestClientToolsE2E_ExplicitAccountAndPromptLimit(t *testing.T) {
 	if auth != "Bearer b-token" {
 		t.Fatal("explicit account ignored", auth)
 	}
-	body["input"] = strings.Repeat("CURRENT_PAYLOAD", 10000)
+	body["input"] = strings.Repeat("CURRENT_PAYLOAD ", 70000)
 	code, out = postClientTool(t, ts.URL, "responses", body)
 	if code != 400 || !strings.Contains(out, "context_length_exceeded") {
 		t.Fatalf("oversize %d %s", code, out)

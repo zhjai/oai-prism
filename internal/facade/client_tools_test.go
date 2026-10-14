@@ -22,6 +22,52 @@ func testClientBridge(t *testing.T, choice string, parallel bool) *clientToolReq
 }
 func clientEnvelope(body string) string { return clientToolFence + "\n" + body + "\n```" }
 
+func TestClientToolJSONDiagnosticsAndCRLF(t *testing.T) {
+	b := testClientBridge(t, "required", false)
+	body := `{"calls":[{"name":"lookup","arguments":{"city":"Paris\\\"\n中文"}}]}`
+	reply, err := b.parseReply(clientToolFence + "\r\n" + body + "\r\n```")
+	if err != nil || len(reply.Calls) != 1 {
+		t.Fatalf("valid CRLF/escaped payload rejected: %v", err)
+	}
+	for _, tc := range []struct{ body, kind string }{
+		{`{"secret":"PRIVATE_DATA","calls":[}`, "syntax"},
+		{`{"secret":"PRIVATE_DATA","calls":[`, "unexpected_eof"},
+		{`{"secret":"PRIVATE_DATA","secret":"PRIVATE_DATA"}`, "duplicate_key"},
+		{`{"secret":"PRIVATE_DATA"} {}`, "trailing_data"},
+	} {
+		_, err := b.parseReply(clientEnvelope(tc.body))
+		if !errors.Is(err, errClientToolOutput) || !strings.Contains(err.Error(), "json_kind="+tc.kind) || !strings.Contains(err.Error(), "sha256=") || strings.Contains(err.Error(), "PRIVATE_DATA") {
+			t.Fatalf("unsafe or missing JSON metadata: %v", err)
+		}
+	}
+}
+
+func TestCastWorldEnvironmentActionNestedParameters(t *testing.T) {
+	raw := json.RawMessage(`[{"type":"function","name":"environment_action","parameters":{"type":"object","properties":{"action_type":{"type":"string","enum":["REQUEST_STATE"]},"state_version":{"type":"integer"},"payload":{"type":"object","properties":{"section":{"type":"string"}},"required":["section"],"additionalProperties":false}},"required":["action_type","state_version","payload"],"additionalProperties":false}}]`)
+	tools, err := normalizeClientTools(raw, "responses")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := &clientToolRequest{tools: tools, choice: "named", named: "environment_action"}
+	body := `{"calls":[{"name":"environment_action","arguments":{"action_type":"REQUEST_STATE","state_version":0,"payload":{"section":"summary"}}}]}`
+	reply, err := b.parseReply(clientEnvelope(body))
+	if err != nil || len(reply.Calls) != 1 {
+		t.Fatalf("nested action failed: %v", err)
+	}
+	var args struct {
+		ActionType   string            `json:"action_type"`
+		StateVersion int               `json:"state_version"`
+		Payload      map[string]string `json:"payload"`
+	}
+	if err := json.Unmarshal(reply.Calls[0].Arguments, &args); err != nil || args.ActionType != "REQUEST_STATE" || args.StateVersion != 0 || args.Payload["section"] != "summary" {
+		t.Fatal("action arguments changed")
+	}
+	_, err = b.parseReply(clientEnvelope(strings.Replace(body, `"section":"summary"`, `"section":"summary",`, 1)))
+	if !errors.Is(err, errClientToolOutput) {
+		t.Fatal("malformed action was repaired or accepted")
+	}
+}
+
 func TestClientToolReplyContracts(t *testing.T) {
 	good := `{"text":"checking","calls":[{"name":"lookup","arguments":{"city":"Paris"}}]}`
 	for _, tc := range []struct {
@@ -253,17 +299,12 @@ func TestClientToolSeedNeverClipsPayload(t *testing.T) {
 	conv := &nativeConversation{history: []historyEntry{{speaker: "User", text: payload}}, seedGroups: []historyEntry{{speaker: "User", text: payload}, {speaker: "User", text: "small complete exchange"}}}
 	nt := &nativeTurn{conv: conv}
 	seeds := nt.seedTurns(8192)
-	if len(seeds) == 0 {
-		t.Fatal("missing restore seed")
+	if len(seeds) != 0 {
+		t.Fatal("generic context entered lossy legacy seed planner")
 	}
-	text := ""
-	for _, seed := range seeds {
-		for _, item := range seed {
-			text += itemText(item)
-		}
-	}
-	if strings.Contains(text, "[truncated]") || strings.Contains(text, "FULL_TOOL_OUTPUT") || !strings.Contains(text, "historical exchange") || !strings.Contains(text, "small complete exchange") {
-		t.Fatal("payload clipped without whole exchange omission")
+	parts, err := splitPreservedTranscript(payload, 8192)
+	if err != nil || strings.Join(parts, "") != payload {
+		t.Fatal("tool result not fully preserved", err)
 	}
 }
 

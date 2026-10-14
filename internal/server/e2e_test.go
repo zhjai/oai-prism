@@ -86,6 +86,11 @@ type fakeUpstream struct {
 	// replyParts 覆盖默认的逐字生成内容（见 parts）。
 	replyParts []string
 
+	// Restore acknowledgments are isolated to fragment requests. Tests can
+	// reject an acknowledgment to verify transactional failure without fallback.
+	preservedContext bool
+	restoreBadAck    bool
+
 	// 会话登记（Server Action createProjectConversation）：convs 是登记过的会话 ID，
 	// actionFails 让登记失败，goneConvs 里的会话在 start 时回 conversation_too_large。
 	convs       map[string]bool
@@ -144,8 +149,9 @@ func (f *fakeUpstream) sandboxRoutes(mux *http.ServeMux) {
 
 // genState 是单个生成请求的状态。
 type genState struct {
-	polls int
-	seq   int // 下次应当收到的 turn_state.seq
+	polls   int
+	seq     int // 下次应当收到的 turn_state.seq
+	restore bool
 }
 
 // parts 是假上游"逐字生成"的内容。
@@ -340,7 +346,20 @@ func (f *fakeUpstream) handler() http.Handler {
 		if f.gens == nil {
 			f.gens = map[string]*genState{}
 		}
-		f.gens[rid] = &genState{polls: 0, seq: 1}
+		restore := false
+		if f.preservedContext {
+			items, _ := body["input"].([]any)
+			for _, item := range items {
+				message, _ := item.(map[string]any)
+				blocks, _ := message["content"].([]any)
+				for _, block := range blocks {
+					b, _ := block.(map[string]any)
+					text, _ := b["text"].(string)
+					restore = restore || strings.HasPrefix(text, "[Client context fragment ")
+				}
+			}
+		}
+		f.gens[rid] = &genState{polls: 0, seq: 1, restore: restore}
 		f.mu.Unlock()
 
 		started := map[string]any{
@@ -401,6 +420,12 @@ func (f *fakeUpstream) handler() http.Handler {
 		f.mu.Unlock()
 
 		parts := f.parts()
+		if st.restore {
+			parts = []string{"OK"}
+			if f.restoreBadAck {
+				parts = []string{"not acknowledged"}
+			}
+		}
 		upto := n
 		if upto > len(parts) {
 			upto = len(parts)

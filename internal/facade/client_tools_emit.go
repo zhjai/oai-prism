@@ -101,6 +101,9 @@ func (s *clientToolStream) event(typ string, fields map[string]any) error {
 }
 
 func clientToolStreamCode(err error) string {
+	if errors.Is(err, errContextRestore) {
+		return "context_restore_failed"
+	}
 	if errors.Is(err, errClientToolOutput) {
 		return "tool_bridge_invalid_output"
 	}

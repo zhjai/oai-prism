@@ -36,10 +36,11 @@ var ErrContextTooLarge = errors.New("context_length_exceeded")
 
 // contextTooLargeError 携带超限的量化信息，errors.Is(err, ErrContextTooLarge) 成立。
 type contextTooLargeError struct {
-	Bytes    int    // 规整后 system + user 的字节数
-	Limit    int    // 生效上限（未配置时为 0）
-	Tokens   int    // 同一份内容的 token 数
-	Upstream string // 上游拒绝时的原文；网关预检拒绝时为空
+	Bytes     int    // 规整后 system + user 的字节数
+	Limit     int    // 生效上限（未配置时为 0）
+	Tokens    int    // 同一份内容的 token 数
+	Upstream  string // 上游拒绝时的原文；网关预检拒绝时为空
+	ConfigKey string // logical-context budget uses max_context_bytes
 }
 
 func (e *contextTooLargeError) Error() string {
@@ -47,8 +48,10 @@ func (e *contextTooLargeError) Error() string {
 		return fmt.Sprintf("上下文超过上游单条消息上限（%d 字节 / %d tokens，上游拒绝：%s）。请压缩历史（Codex 执行 /compact）或开新会话",
 			e.Bytes, e.Tokens, e.Upstream)
 	}
-	return fmt.Sprintf("上下文超过上游单条消息上限：本轮 %d 字节 / %d tokens，上限 %d 字节（facade.max_prompt_bytes）。请压缩历史（Codex 执行 /compact）或开新会话",
-		e.Bytes, e.Tokens, e.Limit)
+	if e.ConfigKey != "" {
+		return fmt.Sprintf("完整客户端上下文超过网关预算：%d 字节 / %d tokens，上限 %d 字节（facade.%s）；未删除或裁剪数据", e.Bytes, e.Tokens, e.Limit, e.ConfigKey)
+	}
+	return fmt.Sprintf("上下文超过上游单条消息上限：本轮 %d 字节 / %d tokens，上限 %d 字节（facade.max_prompt_bytes）。请压缩历史（Codex 执行 /compact）或开新会话", e.Bytes, e.Tokens, e.Limit)
 }
 
 func (e *contextTooLargeError) Is(target error) bool { return target == ErrContextTooLarge }
@@ -86,12 +89,25 @@ func (r *Runner) upstreamPromptItems(req *RunRequest) []prism.InputItem {
 // checkPromptSize 在占用账号、建项目、申请沙箱之前检查提示词大小。
 func (r *Runner) checkPromptSize(req *RunRequest) error {
 	limit := r.cfg.Facade.PromptByteLimit()
+	key := ""
+	if req.PreserveContext {
+		limit = r.cfg.Facade.ContextByteLimit()
+		key = "max_context_bytes"
+	}
 	if limit <= 0 {
 		return nil
 	}
 	items := r.upstreamPromptItems(req)
 	if n := promptBytes(items); n > limit {
-		return &contextTooLargeError{Bytes: n, Limit: limit, Tokens: countInputTokens(items)}
+		return &contextTooLargeError{Bytes: n, Limit: limit, Tokens: countInputTokens(items), ConfigKey: key}
+	}
+	return nil
+}
+
+// Actual send checks run after continuation planning and on every restore part.
+func (r *Runner) checkUpstreamPromptSize(items []prism.InputItem) error {
+	if limit := r.cfg.Facade.PromptByteLimit(); limit > 0 && promptBytes(items) > limit {
+		return &contextTooLargeError{Bytes: promptBytes(items), Limit: limit, Tokens: countInputTokens(items)}
 	}
 	return nil
 }

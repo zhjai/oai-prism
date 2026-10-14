@@ -270,6 +270,8 @@ Chat Completions 使用扩展字段 `progress_content`，Responses 使用 `phase
 
 Responses 用 `function_call_output` / `custom_tool_call_output` 回传结果，可配合 `previous_response_id` 续接；句柄缓存按 API Key 隔离，每条回复从创建时起有效 30 分钟，重启或淘汰后需重新发送完整历史。完整示例、支持范围和错误处理见 [客户端工具调用](docs/客户端工具调用.md)。
 
+通用工具完整上下文预算为 `facade.max_context_bytes: 1048576`（1 MiB，含工具指令）。`max_prompt_bytes: 98304` 继续约束每次上游发送；完整历史优先原生续接，单次放不下时完整分段恢复，不省略历史或截断结果。分段增加耗时，恢复失败返回 `context_restore_failed`。这不等于 Prism 支持 1 MiB 单次消息，也不保证模型逐字记忆所有内容。
+
 <p align="center">
   <img src="docs/assets/screenshot-accounts.png" alt="账号与计划池" width="48%">
   &nbsp;

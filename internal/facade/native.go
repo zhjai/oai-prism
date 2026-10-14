@@ -475,7 +475,7 @@ func (r *Runner) planNative(ctx context.Context, p prism.Principal, acctID, proj
 
 	// 历史一条放不下（全量折叠时被裁过）：先分段把历史补种进新会话，再发本轮 ——
 	// 换号、网关重启、旧会话作废之后，上游照样拿到客户端手里的完整历史。
-	if historyTrimmed(full) {
+	if !req.PreserveContext && historyTrimmed(full) {
 		if seeds := nt.seedTurns(r.cfg.Facade.PromptByteLimit()); len(seeds) > 0 {
 			notice := ""
 			if !req.Bridge && r.cfg.Facade.PlatformNotice {
@@ -507,15 +507,16 @@ func (nt *nativeTurn) currentWithSystem(notice string) []prism.InputItem {
 // seedTurns 把往轮对话切成若干段补种消息，每段不超过单条上限；只补最近的
 // nativeSeedMaxBytes 字节（再早的上游窗口也装不下，会被它自己压缩掉）。limit <= 0 时不补种。
 func (nt *nativeTurn) seedTurns(limit int) [][]prism.InputItem {
+	// Generic transcripts use the transactional, lossless planner exclusively.
+	if nt.conv.seedGroups != nil {
+		return nil
+	}
 	budget := limit - len(nativeSeedSystem) - 160 - promptOverheadReserve
 	if limit <= 0 || budget < 4096 {
 		return nil
 	}
 	var lines []string
 	entries := nt.conv.history
-	if nt.conv.seedGroups != nil {
-		entries = nt.conv.seedGroups
-	}
 	for _, e := range entries {
 		t := strings.TrimSpace(e.text)
 		if t == "" {
@@ -523,11 +524,7 @@ func (nt *nativeTurn) seedTurns(limit int) [][]prism.InputItem {
 		}
 		l := e.speaker + ": " + t
 		if len(l) > budget {
-			if nt.conv.seedGroups != nil {
-				l = fmt.Sprintf("[One historical exchange (%d bytes) omitted: exceeds restore message budget]", len(l))
-			} else {
-				l = cutUTF8(l, budget-32) + " …[truncated]"
-			}
+			l = cutUTF8(l, budget-32) + " …[truncated]"
 		}
 		lines = append(lines, l)
 	}
@@ -587,8 +584,12 @@ func (r *Runner) seedConversation(ctx context.Context, acct *account.Account, re
 			ConversationID: plan.cid, ProjectID: projectID, StickyKey: req.StickyKey,
 			API: req.API, Bridge: true, ExtraHeaders: req.ExtraHeaders, Deadline: req.Deadline,
 		}
-		if _, err := r.runOnce(ctx, acct, sreq, nil); err != nil {
+		res, err := r.runOnce(ctx, acct, sreq, nil)
+		if err != nil {
 			return fmt.Errorf("补种第 %d/%d 段: %w", i+1, len(plan.seeds), err)
+		}
+		if req.PreserveContext && (res == nil || strings.TrimSpace(res.Text) != "OK") {
+			return fmt.Errorf("%w: fragment %d/%d was not acknowledged", errContextRestore, i+1, len(plan.seeds))
 		}
 	}
 	return nil

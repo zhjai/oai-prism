@@ -87,6 +87,10 @@ type RunRequest struct {
 	// A rejected reply must never become a successful continuation prefix.
 	PostProcess func(*RunResult) error
 
+	// PreserveContext forbids pruning generic client-tool transcripts. Admission
+	// measures full context; native planning enforces the separate per-send cap.
+	PreserveContext bool
+
 	// BoundAccountID 是 ProjectID / ConversationID 所属的账号（来自会话链或原生续接的绑定）。
 	// 项目与会话是账号私有资源：实际租到的账号与它不同（粘性过期、原账号冷却、换号重试）时，
 	// 它们在新账号上必然 403/404，必须作废（原生续接随之在新账号上新建会话）。
@@ -315,6 +319,22 @@ func (r *Runner) Run(ctx context.Context, req *RunRequest, emit func(Delta) erro
 		r.log.Warn("提示词超过上游单条上限，未发送", "api", api, "err", err)
 		return nil, err
 	}
+	if req.PreserveContext {
+		// A restore transaction gets one total deadline, not a fresh allowance
+		// for every fragment and final inference.
+		budget := req.Deadline
+		if budget <= 0 {
+			budget = r.cfg.Facade.MaxPollTimeout
+			if emit == nil && r.cfg.Facade.SyncTimeout > 0 {
+				budget = r.cfg.Facade.SyncTimeout
+			}
+		}
+		if budget > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, budget)
+			defer cancel()
+		}
+	}
 
 	var (
 		lastErr error
@@ -359,7 +379,10 @@ func (r *Runner) Run(ctx context.Context, req *RunRequest, emit func(Delta) erro
 				// 续接的上游会话已不可用（被删、超出上游会话上限等）：作废绑定，
 				// 还没吐出内容就用新会话 + 全量上下文原地重来一次。
 				gone := nt.plan != nil && nt.plan.continued && isConversationGone(err)
-				nt.release(gone || errors.Is(err, errClientToolOutput), r)
+				// Once any fragments were delivered, even a later final-turn
+				// failure leaves extra upstream state. Never reuse that prefix.
+				seeded := req.PreserveContext && nt.plan != nil && len(nt.plan.seeds) > 0
+				nt.release(gone || seeded || errors.Is(err, errClientToolOutput) || errors.Is(err, errContextRestore), r)
 				if gone && !emitted && (res == nil || res.Text == "") && ctx.Err() == nil && attempt+1 < r.accountRetries {
 					r.log.Warn("原生续接：上游会话不可用，改用新会话全量重试", "key", nt.key, "err", err)
 					lastErr, lastRes = err, res
@@ -379,6 +402,10 @@ func (r *Runner) Run(ctx context.Context, req *RunRequest, emit func(Delta) erro
 		}
 
 		lastErr = err
+		if errors.Is(err, errContextRestore) {
+			r.app.FacadeRuns.Inc(api, req.Model, "context_restore_failed")
+			return res, err
+		}
 		if errors.Is(err, errClientToolOutput) {
 			r.app.FacadeRuns.Inc(api, req.Model, "invalid_tool_output")
 			return res, err
@@ -542,8 +569,18 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 		// 原生续接：会话 ID 由我们登记，续接时只发增量。
 		inputItems = r.planNative(ctx, p, acct.ID, projectID, req, inputItems)
 		convIDOut = req.Native.plan.cid
+		if req.PreserveContext {
+			var err error
+			inputItems, err = r.planPreservedContext(req, inputItems)
+			if err != nil {
+				return result, err
+			}
+		}
 		if len(req.Native.plan.seeds) > 0 {
 			if err := r.seedConversation(ctx, acct, req, projectID); err != nil {
+				if req.PreserveContext {
+					return result, fmt.Errorf("%w: %w", errContextRestore, err)
+				}
 				if cerr := ctx.Err(); cerr != nil {
 					return result, cerr
 				}
@@ -552,10 +589,8 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 			}
 		}
 	}
-	if req.PostProcess != nil {
-		if limit := r.cfg.Facade.PromptByteLimit(); limit > 0 && promptBytes(inputItems) > limit {
-			return result, &contextTooLargeError{Bytes: promptBytes(inputItems), Limit: limit, Tokens: countInputTokens(inputItems)}
-		}
+	if err := r.checkUpstreamPromptSize(inputItems); err != nil {
+		return result, err
 	}
 
 	// 2.3) 处理图片上传：必须在沙箱工作区同步之前上传至项目！

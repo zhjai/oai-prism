@@ -194,7 +194,7 @@ func (h *Handler) handleClientTools(w http.ResponseWriter, r *http.Request, b *c
 		idPrefix = "msg_"
 	}
 	id := newID(idPrefix)
-	runReq := &RunRequest{Input: input, Model: model, Effort: effort, UserID: user, Metadata: clientMetadata(raw), StickyKey: sticky, AccountID: account, ProjectID: project, API: api, Bridge: true, ExtraHeaders: extractSentinelToken(r)}
+	runReq := &RunRequest{Input: input, Model: model, Effort: effort, UserID: user, Metadata: clientMetadata(raw), StickyKey: sticky, AccountID: account, ProjectID: project, API: api, Bridge: true, PreserveContext: true, ExtraHeaders: extractSentinelToken(r)}
 	known := chatKnownFields
 	if api == "responses" {
 		known = responsesKnownFields
@@ -306,6 +306,14 @@ func (h *Handler) writeClientToolError(w http.ResponseWriter, r *http.Request, a
 			return
 		}
 		writeErrorCode(w, http.StatusBadGateway, "upstream_error", "tool_bridge_invalid_output", err.Error())
+		return
+	}
+	if errors.Is(err, errContextRestore) {
+		if api == "messages" {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "code": "context_restore_failed", "message": "完整上下文恢复失败；未裁剪数据或继续生成，请重试完整请求"}})
+			return
+		}
+		writeErrorCode(w, http.StatusBadGateway, "upstream_error", "context_restore_failed", "完整上下文恢复失败；未裁剪数据或继续生成，请重试完整请求")
 		return
 	}
 	if errors.Is(err, context.Canceled) {

@@ -263,6 +263,11 @@ type FacadeConfig struct {
 	// 默认 96 KiB，给上游自己的包装文本留余量；设为 -1 关闭检查。
 	MaxPromptBytes int `yaml:"max_prompt_bytes"`
 
+	// MaxContextBytes limits complete generic client-tool context before native
+	// continuation or lossless segmentation. It is independent of the physical
+	// per-send MaxPromptBytes cap. Zero uses the 1 MiB default; negative disables.
+	MaxContextBytes int `yaml:"max_context_bytes"`
+
 	// Models 把对外模型名映射到 Prism 内部的 model / reasoning effort。
 	// 例：gpt-5-codex-fast -> {model: gpt-5, effort: high}
 	Models map[string]ModelMapping `yaml:"models"`
@@ -327,6 +332,16 @@ func (f FacadeConfig) PromptByteLimit() int {
 		return 0
 	}
 	return f.MaxPromptBytes
+}
+
+func (f FacadeConfig) ContextByteLimit() int {
+	if f.MaxContextBytes < 0 {
+		return 0
+	}
+	if f.MaxContextBytes == 0 {
+		return DefaultFacadeMaxContextBytes
+	}
+	return f.MaxContextBytes
 }
 
 // RateLimitPerSecond 返回全局限流速率。
@@ -559,6 +574,7 @@ func Default() *Config {
 			DefaultSystemPrompt: DefaultFacadeSystemPrompt,
 			PlatformNotice:      true,
 			MaxPromptBytes:      DefaultFacadeMaxPromptBytes,
+			MaxContextBytes:     DefaultFacadeMaxContextBytes,
 		},
 		RawProxy: RawProxyConfig{
 			Enabled:         true,
@@ -689,6 +705,8 @@ const DefaultFacadeSystemPrompt = "You are a helpful assistant. Answer the user'
 
 // DefaultFacadeMaxPromptBytes 是 facade.max_prompt_bytes 的默认值（见 FacadeConfig.MaxPromptBytes）。
 const DefaultFacadeMaxPromptBytes = 96 << 10
+
+const DefaultFacadeMaxContextBytes = 1 << 20
 
 // DefaultPrismModel 是上游对话模型的默认值。
 //
@@ -871,6 +889,9 @@ func (c *Config) normalize() error {
 	}
 	if f.MaxPromptBytes == 0 {
 		f.MaxPromptBytes = DefaultFacadeMaxPromptBytes
+	}
+	if f.MaxContextBytes == 0 {
+		f.MaxContextBytes = DefaultFacadeMaxContextBytes
 	}
 
 	if c.RawProxy.Prefix == "" {

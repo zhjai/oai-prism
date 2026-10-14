@@ -401,7 +401,7 @@ func validateClientTranscript(turns []clientTurn) error {
 	return nil
 }
 
-func (b *clientToolRequest) conversation(system string, limit int) ([]prism.InputItem, *nativeConversation, error) {
+func (b *clientToolRequest) conversation(system string, _ int) ([]prism.InputItem, *nativeConversation, error) {
 	var sys []string
 	var turns []clientTurn
 	for _, t := range b.turns {
@@ -432,8 +432,7 @@ func (b *clientToolRequest) conversation(system string, limit int) ([]prism.Inpu
 		history = append(history, historyEntry{speaker: speakerOf(t.Role), text: toolText(t)})
 	}
 	conv := &nativeConversation{system: system, history: history, current: current, currentText: currentText, extra: b.directive()}
-	// History pruning removes whole exchanges. Never split a call/result pair or
-	// truncate the current tool payload. Native seeding sees the complete entries.
+	// Group complete exchanges for canonical replay. No history pruning occurs.
 	var exchanges []historyEntry
 	var group strings.Builder
 	for _, t := range turns[:len(turns)-1] {
@@ -452,8 +451,9 @@ func (b *clientToolRequest) conversation(system string, limit int) ([]prism.Inpu
 		activeExchange = "\n[Active tool exchange]\n" + exchanges[len(exchanges)-1].text
 		exchanges = exchanges[:len(exchanges)-1]
 	}
-	fixed := len(system) + len(currentText) + len(b.directive()) + len(activeExchange)
-	items := []prism.InputItem{prism.NewSystemItem(system + renderHistory(exchanges, historyBudget(limit, fixed)) + activeExchange + "\n" + b.directive()), current}
+	// Generic callers require complete data. The runner chooses a small native
+	// delta or restores lossless fragments; never prune complete exchanges here.
+	items := []prism.InputItem{prism.NewSystemItem(system + renderHistory(exchanges, 0) + activeExchange + "\n" + b.directive()), current}
 	return items, conv, nil
 }
 
