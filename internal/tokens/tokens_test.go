@@ -6,6 +6,7 @@ import (
 	"image"
 	"image/png"
 	"math/rand"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -133,6 +134,54 @@ func TestHeapMergeMatchesScan(t *testing.T) {
 			t.Fatalf("k=%d len=%d: heap=%d scan=%d", k, len(piece), got, want)
 		}
 	}
+}
+
+// Exercise heap construction and mixed push/pop independently of BPE using
+// sorted candidate order as the oracle, including equal-rank tie breaking.
+func TestMergeHeapMatchesSortedOrder(t *testing.T) {
+	r := rand.New(rand.NewSource(17))
+	candidate := func() mergeCand { return mergeCand{rank: uint(r.Intn(16)), pos: r.Intn(256)} }
+	h := make(mergeHeap, 2048)
+	for i := range h {
+		h[i] = candidate()
+	}
+	want := append([]mergeCand(nil), h...)
+	h.init()
+	checkPop := func() {
+		t.Helper()
+		sort.Slice(want, func(i, j int) bool {
+			if want[i].rank != want[j].rank {
+				return want[i].rank < want[j].rank
+			}
+			return want[i].pos < want[j].pos
+		})
+		got := h.pop()
+		if got != want[0] {
+			t.Fatalf("heap order got %+v, want %+v", got, want[0])
+		}
+		want = want[1:]
+	}
+	for range 4096 {
+		if len(h) > 0 && r.Intn(2) == 0 {
+			checkPop()
+		} else {
+			c := candidate()
+			h.push(c)
+			want = append(want, c)
+		}
+		if len(h) != len(want) {
+			t.Fatal("heap lost a candidate")
+		}
+	}
+	for len(h) > 0 {
+		checkPop()
+	}
+	h.init() // An empty heap stays empty.
+	h.push(candidate())
+	if len(h) != 1 {
+		t.Fatal("empty heap did not accept a candidate")
+	}
+	h.pop()
 }
 
 // 防 CPU 钉死：2MB 连续字母是单个预切分片段，原 O(n²) 合并永远算不完。

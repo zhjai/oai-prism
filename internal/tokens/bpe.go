@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
-	"container/heap"
 	_ "embed"
 	"encoding/base64"
 	"math"
@@ -170,11 +169,11 @@ func (b *bpe) heapMerge(piece string) int {
 			h = append(h, mergeCand{rank: rank[i], pos: i})
 		}
 	}
-	heap.Init(&h)
+	h.init()
 
 	parts := n
-	for h.Len() > 0 {
-		c := heap.Pop(&h).(mergeCand)
+	for len(h) > 0 {
+		c := h.pop()
 		i := c.pos
 		if !alive[i] || rank[i] != c.rank {
 			continue // 过期候选
@@ -187,12 +186,12 @@ func (b *bpe) heapMerge(piece string) int {
 
 		rank[i] = pairRank(i)
 		if rank[i] != math.MaxUint {
-			heap.Push(&h, mergeCand{rank: rank[i], pos: i})
+			h.push(mergeCand{rank: rank[i], pos: i})
 		}
 		if p := prev[i]; p >= 0 {
 			rank[p] = pairRank(p)
 			if rank[p] != math.MaxUint {
-				heap.Push(&h, mergeCand{rank: rank[p], pos: p})
+				h.push(mergeCand{rank: rank[p], pos: p})
 			}
 		}
 	}
@@ -206,18 +205,57 @@ type mergeCand struct {
 
 type mergeHeap []mergeCand
 
-func (h mergeHeap) Len() int { return len(h) }
-func (h mergeHeap) Less(a, b int) bool {
+// Typed heap operations avoid interface boxing and allocation for every BPE
+// candidate. Ordering is unchanged: rank first, then the leftmost position.
+func (h mergeHeap) less(a, b int) bool {
 	if h[a].rank != h[b].rank {
 		return h[a].rank < h[b].rank
 	}
 	return h[a].pos < h[b].pos
 }
-func (h mergeHeap) Swap(a, b int) { h[a], h[b] = h[b], h[a] }
-func (h *mergeHeap) Push(x any)   { *h = append(*h, x.(mergeCand)) }
-func (h *mergeHeap) Pop() any {
-	old := *h
-	x := old[len(old)-1]
-	*h = old[:len(old)-1]
-	return x
+func (h mergeHeap) init() {
+	for i := len(h)/2 - 1; i >= 0; i-- {
+		h.down(i)
+	}
+}
+
+func (h mergeHeap) down(i int) {
+	for {
+		left := 2*i + 1
+		if left >= len(h) {
+			return
+		}
+		child := left
+		if right := left + 1; right < len(h) && h.less(right, left) {
+			child = right
+		}
+		if !h.less(child, i) {
+			return
+		}
+		h[i], h[child] = h[child], h[i]
+		i = child
+	}
+}
+
+func (h *mergeHeap) push(c mergeCand) {
+	*h = append(*h, c)
+	for i := len(*h) - 1; i > 0; {
+		parent := (i - 1) / 2
+		if !h.less(i, parent) {
+			break
+		}
+		(*h)[i], (*h)[parent] = (*h)[parent], (*h)[i]
+		i = parent
+	}
+}
+
+func (h *mergeHeap) pop() mergeCand {
+	first := (*h)[0]
+	last := len(*h) - 1
+	(*h)[0] = (*h)[last]
+	*h = (*h)[:last]
+	if last > 0 {
+		h.down(0)
+	}
+	return first
 }
