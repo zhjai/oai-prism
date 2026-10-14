@@ -21,11 +21,12 @@ import (
 
 // Handler 是兼容门面的 HTTP 层。
 type Handler struct {
-	cfg     *config.Config
-	log     *slog.Logger
-	runner  *Runner
-	app     *metrics.App
-	catalog modelCatalog
+	cfg         *config.Config
+	log         *slog.Logger
+	runner      *Runner
+	app         *metrics.App
+	catalog     modelCatalog
+	toolHistory clientToolHistory
 }
 
 // NewHandler 构造门面处理器。

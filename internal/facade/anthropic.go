@@ -36,6 +36,11 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "messages 不能为空")
 		return
 	}
+	clientTools, err := h.prepareClientTools(r, rawFields, "messages")
+	if err != nil {
+		clientToolInputError(w, err, "messages")
+		return
+	}
 
 	model, effort := req.Model, ""
 	accountID, projectID := applyHeaderOverrides(r, &model, &effort)
@@ -47,6 +52,10 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		return
 	}
 	req.Model = responseModel(r, req.Model, model)
+	if clientTools != nil {
+		h.handleClientTools(w, r, clientTools, rawFields, "messages", model, effort, req.Model, accountID, projectID)
+		return
+	}
 
 	// Anthropic 把 system 放在顶层字段：交给翻译层当 system，与折叠的历史
 	// 合成唯一一条（上游只读最后一条 system；单独前插一条的话，客户端自带的

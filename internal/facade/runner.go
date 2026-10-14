@@ -83,6 +83,10 @@ type RunRequest struct {
 	// Input 仍是全量折叠后的条目 —— 新建上游会话的首轮与各种回退都发它。
 	Native *nativeTurn
 
+	// PostProcess validates client-tool output before committing native history.
+	// A rejected reply must never become a successful continuation prefix.
+	PostProcess func(*RunResult) error
+
 	// BoundAccountID 是 ProjectID / ConversationID 所属的账号（来自会话链或原生续接的绑定）。
 	// 项目与会话是账号私有资源：实际租到的账号与它不同（粘性过期、原账号冷却、换号重试）时，
 	// 它们在新账号上必然 403/404，必须作废（原生续接随之在新账号上新建会话）。
@@ -171,8 +175,9 @@ func (d *progressDeduper) fresh(events []prism.LiveProgressEvent) []prism.LivePr
 
 // RunResult 是一次运行的最终结果。
 type RunResult struct {
-	Text      string
-	Reasoning string
+	Text               string
+	Reasoning          string
+	CanonicalAssistant *string
 
 	// RequestID 是上游 start 受理句柄（request_id，仅用于轮询/停止）。
 	//
@@ -342,6 +347,9 @@ func (r *Runner) Run(ctx context.Context, req *RunRequest, emit func(Delta) erro
 		}
 
 		res, err := r.runOnce(ctx, lease.Account, req, emit)
+		if err == nil && req.PostProcess != nil {
+			err = req.PostProcess(res)
+		}
 		lease.Release()
 
 		if nt := req.Native; nt != nil {
@@ -351,7 +359,7 @@ func (r *Runner) Run(ctx context.Context, req *RunRequest, emit func(Delta) erro
 				// 续接的上游会话已不可用（被删、超出上游会话上限等）：作废绑定，
 				// 还没吐出内容就用新会话 + 全量上下文原地重来一次。
 				gone := nt.plan != nil && nt.plan.continued && isConversationGone(err)
-				nt.release(gone, r)
+				nt.release(gone || errors.Is(err, errClientToolOutput), r)
 				if gone && !emitted && (res == nil || res.Text == "") && ctx.Err() == nil && attempt+1 < r.accountRetries {
 					r.log.Warn("原生续接：上游会话不可用，改用新会话全量重试", "key", nt.key, "err", err)
 					lastErr, lastRes = err, res
@@ -371,6 +379,10 @@ func (r *Runner) Run(ctx context.Context, req *RunRequest, emit func(Delta) erro
 		}
 
 		lastErr = err
+		if errors.Is(err, errClientToolOutput) {
+			r.app.FacadeRuns.Inc(api, req.Model, "invalid_tool_output")
+			return res, err
+		}
 		if res != nil {
 			lastRes = res
 		}
@@ -538,6 +550,11 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 				r.log.Warn("原生续接：历史补种失败，本轮改发全量（裁剪后）", "cid", convIDOut, "err", err)
 				inputItems = req.Native.plan.fallback
 			}
+		}
+	}
+	if req.PostProcess != nil {
+		if limit := r.cfg.Facade.PromptByteLimit(); limit > 0 && promptBytes(inputItems) > limit {
+			return result, &contextTooLargeError{Bytes: promptBytes(inputItems), Limit: limit, Tokens: countInputTokens(inputItems)}
 		}
 	}
 

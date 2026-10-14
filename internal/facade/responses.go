@@ -33,6 +33,9 @@ type responsesTurn struct {
 	// compaction 标识 Codex 的上下文压缩请求（见 codexRequestKind）：
 	// 回复只能是摘要正文，不能变成工具调用。
 	compaction bool
+	transcript []clientTurn
+	tenant     string
+	store      bool
 }
 
 // codexRequestKind 取 Codex 在 x-codex-turn-metadata 里标注的请求种类（turn / compaction …）。
@@ -84,6 +87,11 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "请求体不是合法 JSON: "+err.Error())
 		return
 	}
+	clientTools, err := h.prepareClientTools(r, rawFields, "responses")
+	if err != nil {
+		clientToolInputError(w, err)
+		return
+	}
 
 	// effort 三级回落：reasoning.effort > metadata.reasoning_effort > 模型映射表。
 	effort := ""
@@ -103,11 +111,15 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Model = responseModel(r, req.Model, model)
+	if clientTools != nil {
+		h.handleClientTools(w, r, clientTools, rawFields, "responses", model, effort, req.Model, accountID, projectID)
+		return
+	}
 
 	// 工具桥：Codex CLI 把工具声明放在 input 的 additional_tools 条目里
 	// （顶层 tools 为 null）。检测到它就切换到桥模式 —— 上游当大脑，
 	// 本地 CLI 当手脚，见 toolbridge.go 顶部注释。
-	bridge := BridgeEnabled(rawFields)
+	bridge := codexBridgeRequest(r, rawFields)
 	compaction := codexRequestKind(r, rawFields) == "compaction"
 	if compaction && !bridge && strings.Contains(string(rawFields["input"]), `"function_call"`) {
 		// 压缩请求不带工具声明；历史里有工具往返时仍按桥翻译，
@@ -125,6 +137,18 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		execToolName: ExecToolName(rawFields),
 		execKind:     ExecToolKind(rawFields),
 		compaction:   compaction,
+		tenant:       middleware.Tenant(r.Context()),
+		store:        string(rawFields["store"]) != "false",
+	}
+	if !bridge {
+		turn.transcript, _ = responsesClientTurns(req.Input)
+		if req.PreviousResponseID != "" {
+			if prior, ok := h.toolHistory.get(turn.tenant, req.PreviousResponseID); ok {
+				turn.transcript = groupClientTurns(append(prior.Turns, turn.transcript...))
+			} else {
+				turn.transcript = nil
+			}
+		}
 	}
 	// 桥判定诊断：CLI 有两条工具声明路径（use_responses_lite 决定）——
 	// true 走 input 里的 additional_tools 条目，false 走顶层 tools 字段。
@@ -343,6 +367,10 @@ func (h *Handler) recordResponsesTurn(runReq *RunRequest, turn *responsesTurn, r
 	}
 	sessionChainRecord(turn.chainKey, res, runReq.Model)
 	sessionChainRecordLocalID(turn.chainKey, turn.id)
+	if !turn.bridge && turn.store && len(turn.transcript) > 0 {
+		turns := append(cloneClientTurns(turn.transcript), clientAssistant(&clientToolReply{Text: res.Text}))
+		h.toolHistory.put(turn.tenant, turn.id, turns, res.AccountID, runReq.Model)
+	}
 	// 弱键客户端的上游会话绑在会话指纹上：下一轮凭回复句柄 / 会话 ID 找回的是会话链的键，
 	// 让它也指向同一个绑定。
 	if nt := runReq.Native; nt != nil {

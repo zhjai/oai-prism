@@ -31,6 +31,11 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "messages 不能为空")
 		return
 	}
+	clientTools, err := h.prepareClientTools(r, rawFields, "chat")
+	if err != nil {
+		clientToolInputError(w, err)
+		return
+	}
 
 	// effort 三级回落：顶层字段 > metadata.reasoning_effort > 模型映射表。
 	effort := req.ReasoningEffort
@@ -47,6 +52,10 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	req.Model = responseModel(r, req.Model, model)
+	if clientTools != nil {
+		h.handleClientTools(w, r, clientTools, rawFields, "chat", model, effort, req.Model, accountID, projectID)
+		return
+	}
 
 	runReq := &RunRequest{
 		Model:        model,
@@ -110,6 +119,7 @@ var chatKnownFields = map[string]struct{}{
 	"frequency_penalty": {}, "seed": {}, "user": {}, "logprobs": {},
 	"top_logprobs": {}, "response_format": {}, "tools": {}, "tool_choice": {},
 	"reasoning_effort": {}, "metadata": {},
+	"parallel_tool_calls": {}, "functions": {}, "function_call": {},
 }
 
 // passthroughFields 挑出未识别的字段。

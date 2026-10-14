@@ -263,10 +263,12 @@ curl http://127.0.0.1:8787/v1/models \
 只有仍有效的 refresh token 或可续期会话 Cookie 才能换发；只有 access token 或上游撤销了登录态时，需重新登录并导入。
 刷新结果保存在 SQLite，开启自动刷新时数据库不可写会阻止启动，避免轮换令牌只留在内存而在重启后丢失。
 
-流式请求会立即转发上游实际提供的推理摘要与进度旁白。网页 Chat 在「上游进度」中独立展示旁白，
+普通聊天和 Codex 工具桥的流式请求会立即转发上游实际提供的推理摘要与进度旁白。网页 Chat 在「上游进度」中独立展示旁白，
 Chat Completions 使用扩展字段 `progress_content`，Responses 使用 `phase: "commentary"` 的消息项。
 旁白不混入最终正文、工具调用解析或网页后续对话历史；这不代表最终答案在上游逐 token 生成并传输。
-Responses `input` 按 Responses item 语义解析；工具调用请使用标准 `function_call` / `function_call_output` 条目。
+通用客户端工具支持 Chat Completions `tools`、Responses 平铺函数和自定义文本工具，以及 Anthropic `tool_use` / `tool_result`。网关将模型输出校验后转换为客户端协议，工具由调用方执行；支持 `tool_choice` 和禁止并行调用。通用工具模式缓冲正文直到校验完成，等待时发送 SSE 心跳。强制调用却没有合法调用时明确报错，不把普通回答当作工具成功。
+
+Responses 用 `function_call_output` / `custom_tool_call_output` 回传结果，可配合 `previous_response_id` 续接；句柄缓存按 API Key 隔离，每条回复从创建时起有效 30 分钟，重启或淘汰后需重新发送完整历史。完整示例、支持范围和错误处理见 [客户端工具调用](docs/客户端工具调用.md)。
 
 <p align="center">
   <img src="docs/assets/screenshot-accounts.png" alt="账号与计划池" width="48%">

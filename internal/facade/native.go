@@ -80,6 +80,8 @@ type nativeConversation struct {
 	currentText string
 	// extra 是本轮附加的 system 指令（如 Codex 压缩指令）：每轮照发，不计入 system 指纹。
 	extra string
+	// Generic tools restore/drop whole exchanges, never clipped JSON payloads.
+	seedGroups []historyEntry
 }
 
 // entries 返回往轮对话加本轮消息（本轮记作 User）。
@@ -292,6 +294,9 @@ func (nt *nativeTurn) deltaItems(b *nativeBinding, rest []historyEntry, limit in
 	added := 0
 	if prior := rest[:len(rest)-1]; len(prior) > 0 {
 		budget := historyBudget(limit, len(system)+len(curText)+len(nativeSinceHeader))
+		if conv.seedGroups != nil {
+			budget = 0
+		}
 		if h := strings.TrimPrefix(renderHistory(prior, budget), historyHeader); h != "" {
 			prefix := nativeSinceHeader + h + "\n\n"
 			added = len(prefix)
@@ -507,14 +512,22 @@ func (nt *nativeTurn) seedTurns(limit int) [][]prism.InputItem {
 		return nil
 	}
 	var lines []string
-	for _, e := range nt.conv.history {
+	entries := nt.conv.history
+	if nt.conv.seedGroups != nil {
+		entries = nt.conv.seedGroups
+	}
+	for _, e := range entries {
 		t := strings.TrimSpace(e.text)
 		if t == "" {
 			continue
 		}
 		l := e.speaker + ": " + t
 		if len(l) > budget {
-			l = cutUTF8(l, budget-32) + " …[truncated]"
+			if nt.conv.seedGroups != nil {
+				l = fmt.Sprintf("[One historical exchange (%d bytes) omitted: exceeds restore message budget]", len(l))
+			} else {
+				l = cutUTF8(l, budget-32) + " …[truncated]"
+			}
 		}
 		lines = append(lines, l)
 	}
@@ -630,7 +643,11 @@ func (nt *nativeTurn) commit(res *RunResult, r *Runner) {
 	b.account, b.project, b.cid, b.weak = res.AccountID, res.ProjectID, plan.cid, nt.weakMatch()
 	b.delivered = plan.delivered
 	if nt.weakMatch() {
-		b.delivered = append(b.delivered, entryFingerprint(historyEntry{speaker: "Assistant", text: res.Text}))
+		text := res.Text
+		if res.CanonicalAssistant != nil {
+			text = *res.CanonicalAssistant
+		}
+		b.delivered = append(b.delivered, entryFingerprint(historyEntry{speaker: "Assistant", text: text}))
 	}
 	if newConv {
 		// 回传给客户端的会话 ID 也能找回这个绑定（见 nativeConvKey）。
